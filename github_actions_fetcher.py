@@ -6,24 +6,32 @@ Open: http://127.0.0.1:8765
 """
 
 import base64
+import hmac
 import hashlib
 import io
 import json
 import os
 import re
+import secrets
 import tempfile
 import time
 import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("PORT", "8765"))
 GITHUB_API = "https://api.github.com"
 MAX_JSON = 4_000_000
+SESSION_TTL = 30 * 60
+SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_bytes(32).hex()
+OAUTH_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
+OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
+sessions = {}
+oauth_states = {}
 
 
 def parse_repo(value):
@@ -47,10 +55,11 @@ def parse_repo(value):
 def github_request(url, token, extra_headers=None):
     headers = {
         "Accept": "application/vnd.github+json",
-        "Authorization": "Bearer " + token,
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "portable-github-actions-fetcher",
     }
+    if token:
+        headers["Authorization"] = "Bearer " + token
     if extra_headers:
         headers.update(extra_headers)
     return urlopen(Request(url, headers=headers), timeout=90)
@@ -69,8 +78,66 @@ def token_from(payload):
     return token or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
 
 
+def cookie_value(handler, name):
+    cookies = {}
+    for part in handler.headers.get("Cookie", "").split(";"):
+        if "=" in part:
+            key, value = part.strip().split("=", 1)
+            cookies[key] = value
+    return cookies.get(name, "")
+
+
+def session_id():
+    raw = secrets.token_urlsafe(32)
+    signature = hmac.new(SESSION_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    return raw + "." + signature
+
+
+def session_for(handler):
+    value = cookie_value(handler, "gbf_session")
+    if "." not in value:
+        return None
+    raw, signature = value.rsplit(".", 1)
+    expected = hmac.new(SESSION_SECRET.encode(), raw.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return None
+    session = sessions.get(raw)
+    if not session:
+        return None
+    if time.time() - session["last_seen"] > SESSION_TTL:
+        sessions.pop(raw, None)
+        return None
+    session["last_seen"] = time.time()
+    return session
+
+
+def session_cookie(handler, value, max_age=SESSION_TTL):
+    handler.send_header("Set-Cookie", f"gbf_session={value}; HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}")
+
+
+def exchange_oauth_code(code):
+    if not OAUTH_CLIENT_ID or not OAUTH_CLIENT_SECRET:
+        raise ValueError("OAuth is not configured. Set GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET.")
+    payload = urlencode({
+        "client_id": OAUTH_CLIENT_ID,
+        "client_secret": OAUTH_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": f"http://{HOST}:{PORT}/oauth/callback",
+    }).encode()
+    request = Request(
+        "https://github.com/login/oauth/access_token",
+        data=payload,
+        headers={"Accept": "application/json", "User-Agent": "portable-github-actions-fetcher"},
+    )
+    with urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode())
+    if result.get("error") or not result.get("access_token"):
+        raise ValueError("GitHub OAuth login was not completed.")
+    return result["access_token"]
+
+
 def validate_token(token):
-    if not token or len(token) > 500 or any(c.isspace() for c in token):
+    if token and (len(token) > 500 or any(c.isspace() for c in token)):
         raise ValueError("Enter a valid GitHub PAT or set GITHUB_PERSONAL_ACCESS_TOKEN.")
 
 
@@ -237,6 +304,7 @@ PAGE = r"""<!doctype html>
 body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% 0,#243b68,#10182c 38%,#0b1020 72%)}
 .wrap{max-width:1040px;margin:auto;padding:44px 22px}.eyebrow{color:#73d7c9;font-size:12px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
 h1{font-size:clamp(38px,6vw,64px);line-height:.98;letter-spacing:-.06em;margin:13px 0 15px}.lead{color:#aebbd2;font-size:17px;line-height:1.5;max-width:650px;margin-bottom:27px}
+.authbar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#13243d;border:1px solid #304263;border-radius:12px;padding:12px 14px;margin-bottom:18px;color:#c9d4e8;font-size:13px}.authbar button{flex:0 0 auto;padding:8px 11px}
 .panel,.card{background:rgba(19,29,52,.85);border:1px solid #304263;border-radius:19px;padding:22px;box-shadow:0 18px 65px #05081366}
 .grid{display:grid;grid-template-columns:1.05fr .95fr;gap:18px}.field{margin-bottom:17px}label,.legend{display:block;color:#c9d4e8;font-size:12px;font-weight:800;margin-bottom:8px}
 input,select{width:100%;border:1px solid #3a4d70;background:#0d1629;color:#f4f7fb;border-radius:10px;padding:12px;font-size:14px;outline:none}
@@ -249,6 +317,7 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
 @media(max-width:740px){.grid{grid-template-columns:1fr}.wrap{padding-top:30px}.facts{grid-template-columns:1fr}}
 </style></head><body><main class="wrap"><div class="eyebrow">GitHub Actions utility</div><h1>Bring a build home.</h1>
 <p class="lead">Inspect workflows, choose a build, test access, and fetch exactly what you need — without Git, GitHub CLI, or extra Python packages.</p>
+<div class="authbar"><span id="authText">Public repositories work without login. OAuth is optional for private repositories.</span><span class="actions"><button id="login" class="secondary">Log in with GitHub</button><button id="logout" class="secondary" style="display:none">Log out</button><button id="revoke" class="secondary" style="display:none">Revoke GitHub access</button></span></div>
 <section class="panel"><div class="field"><label for="repo">Repository link</label><input id="repo" placeholder="https://github.com/owner/repository" autocomplete="url"></div>
 <div class="field"><label for="pat">GitHub personal access token</label><input id="pat" type="password" placeholder="Leave blank if GITHUB_PERSONAL_ACCESS_TOKEN is set" autocomplete="off"><div class="hint">Only used in memory for the request. Never saved or put in an export.</div></div>
 <div class="actions"><button id="test" class="secondary">Test token & access</button><button id="inspect">Load workflows & builds</button></div><div id="status" class="status"></div></section>
@@ -260,10 +329,13 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
 <div class="actions"><button id="download">Fetch selected build</button></div></section>
 <section class="card"><div class="legend">Build summary</div><div id="empty" class="muted">Load the repository to see the latest 20 builds.</div><div id="summary" class="summary"><h2 id="summaryTitle"></h2><div id="facts" class="facts"></div></div><div class="builds" id="builds"></div></section></div>
 <section class="card" style="margin-top:18px"><div class="legend">Individual artifacts</div><div id="artifactHint" class="muted">Select a build to see its artifacts.</div><div id="artifacts"></div></section>
+<section class="card" style="margin-top:18px"><div class="legend">Compare commits</div><div class="muted">Load a repository, then select 2–6 commits to compare together.</div><div id="commitHistory" class="builds"></div><div class="actions"><button id="compare" class="secondary">Compare selected commits</button></div><div id="comparison" class="builds"></div></section>
 <footer>Exports include run.json, checksums.json, README.txt, artifacts, and optional logs. Temporary files are cleaned up automatically after each request.</footer></main>
 <script>
 const $=id=>document.querySelector('#'+id), state={runs:[],artifacts:[]};
 function token(){return $('pat').value} function message(text,kind='ok'){const x=$('status');x.className='status show '+kind;x.textContent=text}
+async function authState(){try{const x=await fetch('/auth/me').then(r=>r.json());if(x.authenticated){$('authText').textContent='Signed in as '+(x.user.login||'GitHub user')+'. Session expires after inactivity.';$('login').style.display='none';$('logout').style.display='inline-block';$('revoke').style.display='inline-block';$('pat').placeholder='OAuth session active — optional PAT fallback'}else if(!$('login').textContent.includes('not configured')){$('authText').textContent='Public repositories work without login. OAuth is optional for private repositories.'}}catch(e){}}
+$('login').onclick=()=>{location.href='/oauth/login'};$('logout').onclick=()=>{location.href='/oauth/logout'};$('revoke').onclick=async()=>{if(!confirm('Revoke this app’s GitHub access?'))return;try{await post('/oauth/revoke',{});location.reload()}catch(e){message(e.message,'error')}};
 function summary(run){$('empty').style.display='none';$('summary').className='summary show';$('summaryTitle').textContent=(run.name||'Workflow')+' · build #'+(run.run_number||'—');const vals=[['Status',run.conclusion||run.status||'—'],['Branch',run.branch||'—'],['Commit',run.commit||'—'],['Author',run.author||'—'],['Event',run.event||'—'],['Message',run.message||'—']];$('facts').innerHTML=vals.map(x=>'<div class="fact"><span>'+x[0]+'</span><b>'+esc(x[1])+'</b></div>').join('')}
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function renderRuns(){const runs=state.runs;$('build').disabled=!runs.length;$('build').innerHTML='<option value="">Latest build</option>'+runs.map(r=>'<option value="'+r.id+'">#'+r.run_number+' · '+esc(r.name||'workflow')+' · '+esc(r.conclusion||r.status)+'</option>').join('');$('builds').innerHTML=runs.map((r,i)=>'<div class="build" data-i="'+i+'"><div><strong>#'+r.run_number+' · '+esc(r.name||'Workflow')+'</strong><small>'+esc(r.branch||'no branch')+' · '+esc((r.commit||'').slice(0,12))+' · '+esc(r.author||'unknown')+'</small></div><span class="pill '+(r.conclusion==='success'?'success':r.conclusion?'failure':'')+'">'+esc(r.conclusion||r.status||'unknown')+'</span></div>').join('');document.querySelectorAll('.build').forEach(x=>x.onclick=()=>selectRun(runs[x.dataset.i]))}
@@ -271,15 +343,19 @@ function selectRun(r){$('selector').value=r.id;summary(r);loadArtifacts(r.id)}
 async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const x=r.headers.get('content-type')?.includes('json')?await r.json():null;if(!r.ok)throw Error(x?.error||'Request failed');return x}
 async function inspect(testOnly=false){if(!$('repo').value.trim())throw Error('Enter a repository link first.');const data=await post(testOnly?'/test':'/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value});if(testOnly){message('Token works and the repository is accessible.','ok');return}
 const w=$('workflow');w.disabled=false;w.innerHTML='<option value="">All workflows</option>'+data.workflows.map(x=>'<option value="'+x.id+'">'+esc(x.name)+' ('+esc(x.state)+')</option>').join('');state.runs=data.runs.map(x=>x.summary);renderRuns();if(state.runs[0])selectRun(state.runs[0]);message('Loaded '+state.runs.length+' recent builds and '+data.workflows.length+' workflows.','ok')}
+async function loadHistory(){try{const x=await post('/history',{repo:$('repo').value,pat:token()});$('commitHistory').innerHTML=x.commits.map(c=>'<label class="check"><input type="checkbox" value="'+esc(c.sha)+'"> <span><b>'+esc(c.sha.slice(0,12))+'</b> · '+esc((c.commit?.message||'').split('\n')[0])+'</span></label>').join('')}catch(e){$('commitHistory').textContent=e.message}}
 async function loadArtifacts(id){try{const x=await post('/artifacts',{repo:$('repo').value,pat:token(),run_id:id});state.artifacts=x.artifacts;$('artifactHint').textContent=x.artifacts.length? 'Download an individual artifact without bundling the whole build.':'No artifacts were attached to this build.';$('artifacts').innerHTML=x.artifacts.map(a=>'<div class="build"><div><strong>'+esc(a.name)+'</strong><small>'+Math.round((a.size_in_bytes||0)/1024)+' KB · '+esc(a.digest||'no digest')+'</small></div><button class="secondary" data-id="'+a.id+'">Download</button></div>').join('');document.querySelectorAll('#artifacts button').forEach(b=>b.onclick=e=>downloadArtifact(e,b.dataset.id))}
 catch(e){$('artifactHint').textContent=e.message}}
 async function downloadArtifact(e,id){e.stopPropagation();const b=e.currentTarget;b.disabled=true;b.textContent='Downloading…';try{const r=await post('/artifact',{repo:$('repo').value,pat:token(),run_id:$('selector').value||$('build').value,artifact_id:id});saveResponse(r,'artifact');message('Individual artifact downloaded.','ok')}catch(x){message(x.message,'error')}finally{b.disabled=false;b.textContent='Download'}}
 function saveResponse(r,kind){if(r.saved_path)message(kind+' saved to '+r.saved_path+'. Browser download is also ready.','ok');const bytes=Uint8Array.from(atob(r.data),c=>c.charCodeAt(0));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([bytes],{type:'application/zip'}));a.download=r.filename;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 $('test').onclick=async()=>{try{$('test').disabled=true;message('Testing GitHub access…');await inspect(true)}catch(e){message(e.message,'error')}finally{$('test').disabled=false}};
 $('inspect').onclick=async()=>{try{$('inspect').disabled=true;message('Loading workflows and builds…');await inspect()}catch(e){message(e.message,'error')}finally{$('inspect').disabled=false}};
+$('inspect').addEventListener('click',loadHistory);
 $('workflow').onchange=async()=>{try{message('Loading builds for this workflow…');const data=await post('/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value});state.runs=data.runs.map(x=>x.summary);renderRuns();if(state.runs[0])selectRun(state.runs[0])}catch(e){message(e.message,'error')}};
 $('build').onchange=()=>{const r=state.runs.find(x=>String(x.id)===$('build').value);if(r)selectRun(r)};
 $('download').onclick=async()=>{try{$('download').disabled=true;message('Fetching artifacts and verifying checksums…');const data=await post('/fetch',{repo:$('repo').value,pat:token(),selector:$('selector').value||$('build').value,workflow_id:$('workflow').value,logs:$('logs').checked,auto:$('auto').checked,save_to:$('save').value});saveResponse(data,'bundle');message('Build bundle ready. '+data.artifacts+' artifact(s) included'+(data.logs?' and logs.':'.'),'ok')}catch(e){message(e.message,'error')}finally{$('download').disabled=false}};
+$('compare').onclick=async()=>{try{const selected=[...document.querySelectorAll('#commitHistory input:checked')].map(x=>x.value);const x=await post('/compare',{repo:$('repo').value,pat:token(),commits:selected});$('comparison').innerHTML=x.comparisons.map(c=>'<div class="build"><div><strong>'+c.base+' → '+c.head+'</strong><small>'+c.commits+' commit(s) · '+c.files+' changed file(s) · '+c.status+'</small></div><span class="pill">'+c.ahead_by+' ahead</span></div>').join('')}catch(e){message(e.message,'error')}};
+authState();
 </script></body></html>"""
 
 
@@ -311,6 +387,51 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/oauth/login":
+            if not OAUTH_CLIENT_ID:
+                self.send_error(HTTPStatus.NOT_IMPLEMENTED, "OAuth is not configured")
+                return
+            state = secrets.token_urlsafe(24)
+            oauth_states[state] = time.time()
+            params = urlencode({
+                "client_id": OAUTH_CLIENT_ID,
+                "redirect_uri": f"http://{HOST}:{PORT}/oauth/callback",
+                "scope": "read:user",
+                "state": state,
+            })
+            self.send_response(HTTPStatus.FOUND)
+            self.send_header("Location", "https://github.com/login/oauth/authorize?" + params)
+            self.end_headers()
+        elif self.path.startswith("/oauth/callback"):
+            from urllib.parse import parse_qs
+            query = parse_qs(urlparse(self.path).query)
+            state = query.get("state", [""])[0]
+            if not state or state not in oauth_states or time.time() - oauth_states.pop(state) > 600:
+                self.send_error(HTTPStatus.BAD_REQUEST, "OAuth state expired or invalid")
+                return
+            try:
+                token = exchange_oauth_code(query.get("code", [""])[0])
+                user = api_json("https://api.github.com/user", token)
+                sid = session_id()
+                raw_sid = sid.split(".", 1)[0]
+                sessions[raw_sid] = {"token": token, "user": user, "last_seen": time.time()}
+                self.send_response(HTTPStatus.FOUND)
+                session_cookie(self, sid)
+                self.send_header("Location", "/")
+                self.end_headers()
+            except Exception as error:
+                self.send_error(HTTPStatus.BAD_REQUEST, nice_error(error))
+        elif self.path == "/oauth/logout":
+            value = cookie_value(self, "gbf_session")
+            if "." in value:
+                sessions.pop(value.rsplit(".", 1)[0], None)
+            self.send_response(HTTPStatus.FOUND)
+            session_cookie(self, "", 0)
+            self.send_header("Location", "/")
+            self.end_headers()
+        elif self.path == "/auth/me":
+            session = session_for(self)
+            self.respond(HTTPStatus.OK, {"authenticated": bool(session), "user": session["user"] if session else None, "expires_in": max(0, int(SESSION_TTL - (time.time() - session["last_seen"]))) if session else 0})
         elif self.path.startswith("/download/"):
             self.send_error(HTTPStatus.NOT_FOUND)
         else:
@@ -319,12 +440,37 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             payload = self.json_body()
-            token = token_from(payload)
+            session = session_for(self)
+            token = token_from(payload) or (session["token"] if session else "")
             validate_token(token)
             owner, repo = parse_repo(payload.get("repo"))
             workflow_id = str(payload.get("workflow_id", "") or "")
             if self.path == "/test":
-                api_json(repo_root(owner, repo), token)
+                if token:
+                    api_json(repo_root(owner, repo), token)
+                else:
+                    api_json(repo_root(owner, repo), "")
+                self.respond(HTTPStatus.OK, {"ok": True})
+                return
+            if self.path == "/oauth/revoke":
+                if not session:
+                    raise ValueError("You are not logged in with OAuth.")
+                request = Request(
+                    f"https://api.github.com/applications/{quote(OAUTH_CLIENT_ID)}/grant",
+                    data=json.dumps({"access_token": session["token"]}).encode(),
+                    headers={
+                        "Authorization": "Basic " + base64.b64encode((OAUTH_CLIENT_ID + ":" + OAUTH_CLIENT_SECRET).encode()).decode(),
+                        "Accept": "application/vnd.github+json",
+                        "Content-Type": "application/json",
+                        "User-Agent": "portable-github-actions-fetcher",
+                    },
+                    method="DELETE",
+                )
+                with urlopen(request, timeout=30):
+                    pass
+                value = cookie_value(self, "gbf_session")
+                if "." in value:
+                    sessions.pop(value.rsplit(".", 1)[0], None)
                 self.respond(HTTPStatus.OK, {"ok": True})
                 return
             if self.path == "/inspect":
@@ -334,6 +480,28 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/artifacts":
                 artifacts = fetch_artifacts(owner, repo, token, int(payload.get("run_id")))
                 self.respond(HTTPStatus.OK, {"artifacts": artifacts})
+                return
+            if self.path == "/history":
+                commits = api_json(repo_root(owner, repo) + "/commits?per_page=30", token)
+                self.respond(HTTPStatus.OK, {"commits": commits})
+                return
+            if self.path == "/compare":
+                commits = [str(item) for item in payload.get("commits", []) if item]
+                if len(commits) < 2 or len(commits) > 6:
+                    raise ValueError("Select between 2 and 6 commits to compare.")
+                comparisons = []
+                for index, base in enumerate(commits[:-1]):
+                    for head in commits[index + 1:]:
+                        result = api_json(repo_root(owner, repo) + f"/compare/{quote(base)}...{quote(head)}", token)
+                        comparisons.append({
+                            "base": base[:12], "head": head[:12],
+                            "status": result.get("status"),
+                            "ahead_by": result.get("ahead_by"),
+                            "behind_by": result.get("behind_by"),
+                            "commits": len(result.get("commits", [])),
+                            "files": len(result.get("files", [])),
+                        })
+                self.respond(HTTPStatus.OK, {"comparisons": comparisons})
                 return
             if self.path == "/artifact":
                 artifacts = fetch_artifacts(owner, repo, token, int(payload.get("run_id")))
