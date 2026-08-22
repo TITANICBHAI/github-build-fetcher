@@ -57,6 +57,26 @@ Generated downloads are stored in `data/exports` for up to 24 hours, so
 restarting the Python process does not immediately invalidate a download.
 That folder is ignored by Git.
 
+## Push the project to GitHub
+
+`push_current_code.py` safely pushes the current folder to the configured
+`github-build-fetcher` repository. It uses only Git and Python's standard
+library. The token is read from `GITHUB_PERSONAL_ACCESS_TOKEN` at runtime and
+is sent as a temporary HTTP header; it is not saved in the remote URL or files.
+
+```bash
+python push_current_code.py
+```
+
+To keep a console process running and push detected changes automatically:
+
+```bash
+python push_current_code.py --watch --interval 60
+```
+
+On Windows, use `push_current_code.bat`. On macOS/Linux, use
+`./push_current_code.sh`.
+
 ## Persistence and credentials
 
 - Exported ZIP files persist in `data/exports` until they are older than 24 hours.
