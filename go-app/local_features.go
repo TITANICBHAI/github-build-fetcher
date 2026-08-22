@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -16,6 +19,185 @@ import (
 	"sync"
 	"time"
 )
+
+func oauthLogin(clientID, clientSecret, addr string) (string, error) {
+	if clientID == "" || clientSecret == "" {
+		return "", errors.New("set GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET before OAuth login")
+	}
+	stateBytes := make([]byte, 24)
+	if _, err := rand.Read(stateBytes); err != nil {
+		return "", err
+	}
+	state := base64.RawURLEncoding.EncodeToString(stateBytes)
+	result := make(chan struct {
+		token string
+		err   error
+	}, 1)
+	mux := http.NewServeMux()
+	server := &http.Server{Addr: addr, Handler: mux}
+	mux.HandleFunc("/oauth/callback", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("state") != state {
+			http.Error(w, "OAuth state is invalid or expired.", http.StatusBadRequest)
+			return
+		}
+		code := r.URL.Query().Get("code")
+		if code == "" {
+			result <- struct {
+				token string
+				err   error
+			}{"", errors.New("OAuth authorization was cancelled")}
+			http.Error(w, "Authorization was cancelled.", http.StatusBadRequest)
+			return
+		}
+		token, err := exchangeOAuthCode(clientID, clientSecret, code, "http://"+addr+"/oauth/callback")
+		if err == nil {
+			fmt.Fprintln(w, "Authorization complete. You can close this window.")
+		} else {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		result <- struct {
+			token string
+			err   error
+		}{token, err}
+		go server.Shutdown(context.Background())
+	})
+	go server.ListenAndServe()
+	time.Sleep(150 * time.Millisecond)
+	redirect := "http://" + addr + "/oauth/callback"
+	loginURL := "https://github.com/login/oauth/authorize?" + url.Values{
+		"client_id": {clientID}, "redirect_uri": {redirect}, "scope": {"repo read:user"}, "state": {state},
+	}.Encode()
+	fmt.Println("Opening GitHub authorization in your browser.")
+	fmt.Println("If it does not open, visit:", loginURL)
+	openControlWindowURL(loginURL)
+	select {
+	case response := <-result:
+		return response.token, response.err
+	case <-time.After(10 * time.Minute):
+		_ = server.Shutdown(context.Background())
+		return "", errors.New("OAuth login timed out")
+	}
+}
+
+func exchangeOAuthCode(clientID, clientSecret, code, redirect string) (string, error) {
+	response, err := http.PostForm("https://github.com/login/oauth/access_token", url.Values{
+		"client_id": {clientID}, "client_secret": {clientSecret}, "code": {code}, "redirect_uri": {redirect},
+	})
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	var payload struct {
+		Token string `json:"access_token"`
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		return "", err
+	}
+	if payload.Token == "" {
+		return "", fmt.Errorf("OAuth authorization failed: %s", payload.Error)
+	}
+	return payload.Token, nil
+}
+
+func oauthRevoke(clientID, clientSecret, token string) error {
+	if clientID == "" || clientSecret == "" {
+		return errors.New("set GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET before revoking access")
+	}
+	request, err := http.NewRequest(http.MethodDelete, "https://api.github.com/applications/"+url.PathEscape(clientID)+"/grant", nil)
+	if err != nil {
+		return err
+	}
+	request.SetBasicAuth(clientID, clientSecret)
+	request.Header.Set("Accept", "application/vnd.github+json")
+	request.Header.Set("User-Agent", "github-fetcher-go")
+	query := request.URL.Query()
+	query.Set("access_token", token)
+	request.URL.RawQuery = query.Encode()
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("OAuth revoke returned HTTP %d", response.StatusCode)
+	}
+	return nil
+}
+
+func openControlWindowURL(target string) {
+	switch runtime.GOOS {
+	case "darwin":
+		_ = exec.Command("open", target).Start()
+	case "windows":
+		_ = exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Start()
+	default:
+		_ = exec.Command("xdg-open", target).Start()
+	}
+}
+
+func persistLocalDownload(source, directory string) (string, error) {
+	if directory == "" {
+		directory = filepath.Join("data", "exports")
+	}
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return "", err
+	}
+	tokenBytes := make([]byte, 24)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		return "", err
+	}
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	input, err := os.Open(source)
+	if err != nil {
+		return "", err
+	}
+	defer input.Close()
+	output, err := os.OpenFile(filepath.Join(directory, token+".zip"), os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		return "", err
+	}
+	if _, err := io.Copy(output, input); err != nil {
+		output.Close()
+		return "", err
+	}
+	if err := output.Close(); err != nil {
+		return "", err
+	}
+	name := filepath.Base(source)
+	if err := os.WriteFile(filepath.Join(directory, token+".json"), []byte(name), 0600); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
+func serveDownloads(addr, directory string) error {
+	if directory == "" {
+		directory = filepath.Join("data", "exports")
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/download/", func(w http.ResponseWriter, r *http.Request) {
+		token := strings.TrimPrefix(r.URL.Path, "/download/")
+		if len(token) < 20 || strings.ContainsAny(token, `/\.`) {
+			http.NotFound(w, r)
+			return
+		}
+		path := filepath.Join(directory, token+".zip")
+		if _, err := os.Stat(path); err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		name := "download.zip"
+		if data, err := os.ReadFile(filepath.Join(directory, token+".json")); err == nil && len(data) > 0 {
+			name = safeName(strings.TrimSpace(string(data)))
+		}
+		w.Header().Set("Content-Type", "application/zip")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		w.Header().Set("Cache-Control", "no-store")
+		http.ServeFile(w, r, path)
+	})
+	return http.ListenAndServe(addr, mux)
+}
 
 // LocalJob is the small, dependency-free job protocol shared by watch mode and
 // the optional control window. Tokens and credentials are deliberately absent.

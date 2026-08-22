@@ -112,6 +112,28 @@ Subsequent Linux/macOS runs can read that credential back from the same manager;
 the Windows build deliberately requires an environment variable for retrieval
 unless a native credential client is supplied.
 
+Browser-oriented commands:
+
+```bash
+# OAuth login opens GitHub in the default browser and stores the result securely.
+./github-fetcher --oauth-login
+
+# Revoke the stored OAuth grant.
+./github-fetcher --oauth-revoke
+
+# Run an export as a cancellable job and keep a browser download available.
+./github-fetcher --repo https://github.com/owner/repository \
+  --output build-export.zip --background --download-server 127.0.0.1:8765
+
+# Run a file upload as a background job.
+./github-fetcher --repo https://github.com/owner/repository \
+  --upload build-export.zip --path exports/build-export.zip --background
+```
+
+The download server is intentionally local and in-memory-controlled: files are
+written with restrictive permissions and are only served when the process is
+kept running. Stop the process when the browser download is complete.
+
 Run filtering additionally supports `--actor-filter` and `--commit-filter`,
 while existing branch, status, event, workflow-name, and date filters remain
 available. API failures include operation context and should be treated as

@@ -87,6 +87,7 @@ type artifact struct {
 	Name     string `json:"name"`
 	Size     int64  `json:"size_in_bytes"`
 	Download string `json:"archive_download_url"`
+	Digest   string `json:"digest"`
 }
 type contentFile struct {
 	Content  string `json:"content"`
@@ -147,6 +148,22 @@ func (c *client) json(endpoint string, target any) error {
 		return &apiError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(target)
+}
+
+func (c *client) jsonWithHeaders(endpoint string, target any) (http.Header, error) {
+	resp, err := c.request(http.MethodGet, endpoint, nil, "application/vnd.github+json")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return resp.Header, &apiError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(target); err != nil {
+		return resp.Header, err
+	}
+	return resp.Header, nil
 }
 
 func (c *client) mutate(method, endpoint string, payload any, target any) error {
@@ -255,7 +272,8 @@ func (c *client) rateLimit(repo repoRef) (map[string]any, error) {
 			} `json:"core"`
 		} `json:"resources"`
 	}
-	if err := c.json("/rate_limit", &limit); err != nil {
+	headers, err := c.jsonWithHeaders("/rate_limit", &limit)
+	if err != nil {
 		return nil, err
 	}
 	var repository struct {
@@ -280,7 +298,39 @@ func (c *client) rateLimit(repo repoRef) (map[string]any, error) {
 		"repository":    repo.owner + "/" + repo.name,
 		"visibility":    visibility,
 		"authenticated": c.token != "",
+		"scopes":        splitHeader(headers.Get("X-OAuth-Scopes")),
+		"header_authenticated": headers.Get("X-OAuth-Scopes") != "",
+		"permissions": map[string]bool{
+			"Actions read":          c.token == "" || hasScope(headers, "actions:read") || hasScope(headers, "repo"),
+			"Contents read":         c.token == "" || hasScope(headers, "contents:read") || hasScope(headers, "repo") || hasScope(headers, "public_repo"),
+			"Contents write":        c.token == "" || hasScope(headers, "contents:write") || hasScope(headers, "repo"),
+			"Pull requests write":   c.token == "" || hasScope(headers, "pull_requests:write") || hasScope(headers, "repo"),
+		},
 	}, nil
+}
+
+func splitHeader(value string) []string {
+	var result []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+func hasScope(headers http.Header, scope string) bool {
+	for _, item := range splitHeader(headers.Get("X-OAuth-Scopes")) {
+		if item == scope {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *client) commits(repo repoRef) ([]map[string]any, error) {
+	var result []map[string]any
+	return result, c.json(fmt.Sprintf("/repos/%s/%s/commits?per_page=30", repo.owner, repo.name), &result)
 }
 
 func (c *client) branches(repo repoRef) ([]struct {
@@ -792,6 +842,10 @@ func main() {
 	projectDir := flag.String("project-dir", ".", "project directory for --push-project")
 	projectPath := flag.String("project-path", "project", "repository prefix for --push-project")
 	control := flag.String("window", "", "open a local control window on HOST:PORT, e.g. 127.0.0.1:8765")
+	background := flag.Bool("background", false, "run fetch or file upload as a cancellable background job")
+	downloadServer := flag.String("download-server", "", "serve persistent downloads on HOST:PORT")
+	oauthLoginFlag := flag.Bool("oauth-login", false, "complete OAuth login in a browser and store the token in the OS credential manager")
+	oauthRevokeFlag := flag.Bool("oauth-revoke", false, "revoke the stored OAuth access grant")
 	device := flag.Bool("device-login", false, "authenticate with GitHub's device flow without GitHub CLI")
 	storeCredentialFlag := flag.Bool("store-credential", false, "store the supplied token in the operating system credential manager")
 	credentialService := flag.String("credential-service", "github-fetcher", "service name for --store-credential")
@@ -826,6 +880,36 @@ func main() {
 		}
 		encoded, _ := json.MarshalIndent(values, "", "  ")
 		fmt.Println(string(encoded))
+		return
+	}
+	if *oauthLoginFlag {
+		oauthToken, loginErr := oauthLogin(os.Getenv("GITHUB_OAUTH_CLIENT_ID"), os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"), "127.0.0.1:8766")
+		if loginErr != nil {
+			fmt.Fprintln(os.Stderr, "OAuth login failed:", loginErr)
+			os.Exit(1)
+		}
+		if storeErr := storeCredential(*credentialService, *credentialAccount, oauthToken); storeErr != nil {
+			fmt.Fprintln(os.Stderr, "OAuth login succeeded, but secure credential storage failed:", storeErr)
+			os.Exit(1)
+		}
+		fmt.Println("OAuth login succeeded and the token was stored in the OS credential manager.")
+		return
+	}
+	if *oauthRevokeFlag {
+		token := strings.TrimSpace(os.Getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
+		if token == "" {
+			storedToken, loadErr := loadCredential(*credentialService, *credentialAccount)
+			if loadErr != nil {
+				fmt.Fprintln(os.Stderr, "OAuth revoke failed:", loadErr)
+				os.Exit(1)
+			}
+			token = storedToken
+		}
+		if revokeErr := oauthRevoke(os.Getenv("GITHUB_OAUTH_CLIENT_ID"), os.Getenv("GITHUB_OAUTH_CLIENT_SECRET"), token); revokeErr != nil {
+			fmt.Fprintln(os.Stderr, "OAuth revoke failed:", revokeErr)
+			os.Exit(1)
+		}
+		fmt.Println("OAuth access was revoked.")
 		return
 	}
 	repo, err := parseRepo(*repoArg)
@@ -864,6 +948,14 @@ func main() {
 	}
 	c := &client{token: token, http: &http.Client{Timeout: 90 * time.Second}}
 	jobs := newLocalJobs()
+	if *downloadServer != "" {
+		go func() {
+			if err := serveDownloads(*downloadServer, filepath.Join("data", "exports")); err != nil {
+				fmt.Fprintln(os.Stderr, "Download server stopped:", err)
+			}
+		}()
+		fmt.Println("Persistent downloads available at http://" + *downloadServer + "/download/<token>")
+	}
 	if *control != "" {
 		go func() {
 			if err := serveControlWindow(jobs, *control); err != nil {
@@ -889,6 +981,25 @@ func main() {
 			}
 			time.Sleep(250 * time.Millisecond)
 		}
+	}
+	if *background && *upload != "" {
+		if *uploadPath == "" {
+			*uploadPath = filepath.Base(*upload)
+		}
+		id := jobs.start("file-upload", func(ctx context.Context) (map[string]any, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			if err := uploadFile(c, repo, *upload, *branch, *uploadPath, *message, *overwrite, *dryRun, *confirm); err != nil {
+				return nil, err
+			}
+			return map[string]any{"path": *uploadPath, "branch": *branch}, nil
+		})
+		fmt.Println("File upload job started:", id)
+		waitForLocalJob(jobs, id)
+		return
 	}
 	if *upload != "" {
 		if *uploadPath == "" {
@@ -993,6 +1104,34 @@ func main() {
 		}
 		return
 	}
+	if *background {
+		id := jobs.start("fetch", func(ctx context.Context) (map[string]any, error) {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+			}
+			items, err := c.artifacts(repo, runs[0].ID)
+			if err != nil {
+				return nil, err
+			}
+			if err := writeExport(repo, runs[0], items, *includeLogs || (*autoLogs && runs[0].Conclusion == "failure"), *output, c); err != nil {
+				return nil, err
+			}
+			result := map[string]any{"output": *output, "artifacts": len(items)}
+			if *downloadServer != "" {
+				token, err := persistLocalDownload(*output, filepath.Join("data", "exports"))
+				if err != nil {
+					return nil, err
+				}
+				result["download_url"] = "http://" + *downloadServer + "/download/" + token
+			}
+			return result, nil
+		})
+		fmt.Println("Fetch job started:", id)
+		waitForLocalJob(jobs, id)
+		return
+	}
 	run := runs[0]
 	items, err := c.artifacts(repo, run.ID)
 	if err != nil {
@@ -1029,6 +1168,15 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Export written to %s\n", *output)
+	if *downloadServer != "" {
+		token, err := persistLocalDownload(*output, filepath.Join("data", "exports"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Persistent download failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Persistent browser download: http://" + *downloadServer + "/download/" + token)
+		select {}
+	}
 }
 
 func showDetails(c *client, repo repoRef, run workflowRun) {
@@ -1051,5 +1199,29 @@ func showDetails(c *client, repo repoRef, run workflowRun) {
 			}
 			fmt.Printf("  - %s: %s\n", step.Name, stepStatus)
 		}
+	}
+}
+
+func waitForLocalJob(manager *localJobs, id string) {
+	for {
+		job, err := manager.snapshot(id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return
+		}
+		fmt.Printf("Job %s: %s — %s\n", job.ID, job.Status, job.Message)
+		if job.Status == "completed" {
+			if job.Result != nil {
+				fmt.Println("Result:", job.Result)
+			}
+			return
+		}
+		if job.Status == "failed" || job.Status == "cancelled" {
+			if job.Error != "" {
+				fmt.Fprintln(os.Stderr, job.Error)
+			}
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 }
