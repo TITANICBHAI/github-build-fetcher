@@ -64,6 +64,7 @@ type workflow struct {
 }
 type job struct {
 	Name        string `json:"name"`
+	Event       string `json:"event"`
 	Status      string `json:"status"`
 	Conclusion  string `json:"conclusion"`
 	HTMLURL     string `json:"html_url"`
@@ -177,6 +178,33 @@ func (c *client) runs(repo repoRef, selector string, workflowID int64) ([]workfl
 		}
 	}
 	return nil, fmt.Errorf("run %s was not found in the latest 20 runs", selector)
+}
+
+func filterRuns(runs []workflowRun, branch, status, event, name, since string) []workflowRun {
+	var filtered []workflowRun
+	for _, run := range runs {
+		if branch != "" && !strings.Contains(strings.ToLower(run.Branch), strings.ToLower(branch)) {
+			continue
+		}
+		currentStatus := run.Conclusion
+		if currentStatus == "" {
+			currentStatus = run.Status
+		}
+		if status != "" && !strings.EqualFold(currentStatus, status) {
+			continue
+		}
+		if event != "" && !strings.EqualFold(run.Event, event) {
+			continue
+		}
+		if name != "" && !strings.Contains(strings.ToLower(run.Name), strings.ToLower(name)) {
+			continue
+		}
+		if since != "" && len(run.CreatedAt) >= 10 && run.CreatedAt[:10] < since {
+			continue
+		}
+		filtered = append(filtered, run)
+	}
+	return filtered
 }
 
 func (c *client) runJobs(repo repoRef, runID int64) ([]job, error) {
@@ -595,6 +623,7 @@ func main() {
 	repoArg := flag.String("repo", "", "GitHub repository URL")
 	runArg := flag.String("run", "", "run ID or run number; defaults to latest")
 	workflowArg := flag.Int64("workflow", 0, "workflow ID to inspect")
+	listWorkflows := flag.Bool("workflow-list", false, "list available workflows")
 	output := flag.String("output", "", "write a ZIP export to this path")
 	artifactID := flag.Int64("artifact", 0, "download one artifact by ID")
 	artifactOutput := flag.String("artifact-output", "", "destination for --artifact")
@@ -603,6 +632,11 @@ func main() {
 	inspect := flag.Bool("inspect", true, "list recent workflow runs")
 	scan := flag.Bool("scan", false, "scan the current directory for protected files and secrets")
 	details := flag.Bool("details", false, "show jobs and step status for the selected run")
+	branchFilter := flag.String("branch-filter", "", "only show runs whose branch contains this text")
+	statusFilter := flag.String("status-filter", "", "only show runs with this status")
+	eventFilter := flag.String("event-filter", "", "filter by event when present in the GitHub response")
+	nameFilter := flag.String("name-filter", "", "only show runs whose workflow name contains this text")
+	since := flag.String("since", "", "only show runs created on or after YYYY-MM-DD")
 	diagnostics := flag.Bool("diagnostics", false, "show API rate limit and repository visibility")
 	listBranches := flag.Bool("branches", false, "list repository branches")
 	compareBase := flag.String("compare-base", "", "base commit or branch for comparison")
@@ -710,11 +744,22 @@ func main() {
 		}
 		fmt.Printf("%s → %s: %v commits, %v files, %v ahead\n", *compareBase, *compareHead, result["total_commits"], result["changed_files"], result["ahead_by"])
 	}
+	if *listWorkflows {
+		workflows, err := c.workflows(repo)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Workflow listing failed:", err)
+			os.Exit(1)
+		}
+		for _, item := range workflows {
+			fmt.Printf("%d\t%s\t%s\n", item.ID, item.Name, item.State)
+		}
+	}
 	runs, err := c.runs(repo, *runArg, *workflowArg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	runs = filterRuns(runs, *branchFilter, *statusFilter, *eventFilter, *nameFilter, *since)
 	if *inspect {
 		fmt.Printf("\n%s/%s — recent Actions runs\n\n", repo.owner, repo.name)
 		for _, run := range runs {
