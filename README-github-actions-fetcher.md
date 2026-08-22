@@ -74,6 +74,20 @@ To keep a console process running and push detected changes automatically:
 python push_current_code.py --watch --interval 60
 ```
 
+Before using watch mode, preview the exact staged changes without a token,
+commit, or network push:
+
+```bash
+python push_current_code.py --dry-run
+```
+
+The push helper refuses protected environment/credential files, private keys,
+database files, local export/download folders, files larger than 10 MB, and
+files containing common GitHub, cloud, or private-key credential patterns. It
+prints every file selected for a push. Add `--confirm` to require an interactive
+confirmation before the first push in that process; this works well with a
+manual run, while unattended watch mode should omit it.
+
 On Windows, use `push_current_code.bat`. On macOS/Linux, use
 `./push_current_code.sh`.
 

@@ -1,0 +1,102 @@
+1. Safety guard for automatic GitHub pushes
+The watch workflow can accidentally commit sensitive files. Add:
+
+Dry-run mode
+Protected file list for .env, tokens, private keys, database files, and local exports
+Secret scanning before commit
+Show the files that will be pushed
+Optional confirmation before the first push
+Maximum file-size protection
+This is the most important improvement.
+
+2. Real download progress
+The current progress messages show stages, but not exact percentage. Improve it with:
+
+Current artifact name
+Downloaded MB / total MB
+Percentage
+Overall progress across all artifacts and logs
+Retry status
+Cancel button
+This requires changing downloads into background jobs instead of keeping the browser request open.
+
+3. Export history
+Add a local history page showing:
+
+Repository
+Workflow
+Run number
+Status
+Export date
+File size
+Included artifacts/logs
+Download again
+Delete export
+The history can be stored in a small local JSON file, with no database or external service.
+
+4. Detailed run page
+Let users open a run and see:
+
+Full commit message
+Branch
+Actor
+Duration
+Job list
+Step status
+Failed step
+GitHub run link
+Logs inside the app
+5. Better upload protection
+For GitHub uploads, add:
+
+Branch selector loaded from GitHub
+File preview before committing
+Existing-file comparison
+Commit diff preview
+“Create new branch” option
+Optional pull request instead of direct commit
+Confirmation showing exactly what will change
+6. Repository profiles
+Save non-sensitive settings locally:
+
+Repository URL
+Default branch
+Preferred workflow
+Filter settings
+Default upload path
+Default commit message
+The PAT should remain memory-only or environment-variable based.
+
+7. API rate-limit dashboard
+Show:
+
+Remaining GitHub API requests
+Reset time
+Authentication status
+Repository visibility
+Required permissions
+Token validation result
+This would make permission and rate-limit problems much easier to understand.
+
+8. Reliable background job system
+Add a local job queue for:
+
+Downloads
+Log fetching
+Uploads
+Retries
+Cancellation
+Multiple exports
+This would make the app much more stable for large builds.
+
+9. Backup and restore settings
+Allow users to export/import non-secret app settings as a JSON file. Never include PATs or credentials.
+
+10. Packaging for Windows
+Create a simple distribution package with:
+
+Start script
+Stop script
+Desktop shortcut instructions
+Automatic browser opening
+Optional .exe build later
