@@ -83,9 +83,16 @@ jobs:
           Copy-Item .\WINDOWS-EXECUTABLES.md .\portable-package\
           Compress-Archive -Path .\portable-package\* -DestinationPath .\github-actions-python-portable-windows-amd64.zip
 
-      - name: Install pinned Inno Setup
+      - name: Ensure Inno Setup is available
         shell: powershell
-        run: choco install innosetup --version=6.4.2 --no-progress --yes
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --version=6.4.2 --allow-downgrade --no-progress --yes
+          }
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler was not found at $iscc"
+          }
 
       - name: Build Windows installer package
         shell: powershell
