@@ -276,44 +276,93 @@ func (c *client) artifacts(repo repoRef, runID int64) ([]artifact, error) {
 }
 
 func (c *client) download(endpoint, destination string) error {
-	resp, err := c.request(http.MethodGet, endpoint, nil, "application/vnd.github+json")
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("GitHub returned HTTP %d while downloading", resp.StatusCode)
-	}
-	out, err := os.Create(destination)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	total := resp.ContentLength
-	var copied int64
-	buffer := make([]byte, 64*1024)
-	for {
-		n, readErr := resp.Body.Read(buffer)
-		if n > 0 {
-			if _, err := out.Write(buffer[:n]); err != nil {
-				return err
+	partial := destination + ".part"
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		var offset int64
+		if info, err := os.Stat(partial); err == nil {
+			offset = info.Size()
+		}
+		req, err := http.NewRequest(http.MethodGet, apiRoot+endpoint, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+		req.Header.Set("User-Agent", "github-fetcher-go")
+		if c.token != "" {
+			req.Header.Set("Authorization", "Bearer "+c.token)
+		}
+		if offset > 0 {
+			req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = err
+		} else if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			lastErr = fmt.Errorf("GitHub returned HTTP %d while downloading", resp.StatusCode)
+			resp.Body.Close()
+		} else {
+			resume := offset > 0 && resp.StatusCode == http.StatusPartialContent
+			if !resume {
+				offset = 0
 			}
-			copied += int64(n)
-			if total > 0 {
-				fmt.Printf("\r  %s: %.0f%% (%s / %s)", filepath.Base(destination), float64(copied)*100/float64(total), formatBytes(copied), formatBytes(total))
+			mode := os.O_CREATE | os.O_WRONLY
+			if resume {
+				mode |= os.O_APPEND
 			} else {
-				fmt.Printf("\r  %s: %s", filepath.Base(destination), formatBytes(copied))
+				mode |= os.O_TRUNC
+			}
+			out, createErr := os.OpenFile(partial, mode, 0600)
+			if createErr != nil {
+				resp.Body.Close()
+				return createErr
+			}
+			total := resp.ContentLength
+			if resume && total > 0 {
+				total += offset
+			}
+			copied := offset
+			buffer := make([]byte, 64*1024)
+			lastErr = nil
+			for {
+				n, readErr := resp.Body.Read(buffer)
+				if n > 0 {
+					if _, writeErr := out.Write(buffer[:n]); writeErr != nil {
+						lastErr = writeErr
+						break
+					}
+					copied += int64(n)
+					if total > 0 {
+						fmt.Printf("\r  %s: %.0f%% (%s / %s)", filepath.Base(destination), float64(copied)*100/float64(total), formatBytes(copied), formatBytes(total))
+					} else {
+						fmt.Printf("\r  %s: %s", filepath.Base(destination), formatBytes(copied))
+					}
+				}
+				if readErr == io.EOF {
+					break
+				}
+				if readErr != nil {
+					lastErr = readErr
+					break
+				}
+			}
+			out.Close()
+			resp.Body.Close()
+			if lastErr == nil {
+				if err := os.Rename(partial, destination); err != nil {
+					return err
+				}
+				fmt.Println()
+				return nil
 			}
 		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return readErr
+		if attempt < 3 {
+			fmt.Printf("\n  Download interrupted; retrying (%d/3)…\n", attempt+1)
+			time.Sleep(time.Duration(attempt) * time.Second)
 		}
 	}
-	fmt.Println()
-	return nil
+	return lastErr
 }
 
 func (c *client) existingFile(repo repoRef, branch, path string) (*contentFile, error) {
@@ -547,6 +596,8 @@ func main() {
 	runArg := flag.String("run", "", "run ID or run number; defaults to latest")
 	workflowArg := flag.Int64("workflow", 0, "workflow ID to inspect")
 	output := flag.String("output", "", "write a ZIP export to this path")
+	artifactID := flag.Int64("artifact", 0, "download one artifact by ID")
+	artifactOutput := flag.String("artifact-output", "", "destination for --artifact")
 	includeLogs := flag.Bool("logs", false, "include workflow logs")
 	autoLogs := flag.Bool("auto-logs", true, "include logs automatically for failed runs")
 	inspect := flag.Bool("inspect", true, "list recent workflow runs")
@@ -685,6 +736,30 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	if *artifactID > 0 {
+		var selected *artifact
+		for i := range items {
+			if items[i].ID == *artifactID {
+				selected = &items[i]
+				break
+			}
+		}
+		if selected == nil {
+			fmt.Fprintf(os.Stderr, "Artifact %d was not found on run #%d.\n", *artifactID, run.RunNumber)
+			os.Exit(1)
+		}
+		destination := *artifactOutput
+		if destination == "" {
+			destination = safeName(selected.Name) + ".zip"
+		}
+		fmt.Printf("Downloading artifact: %s\n", selected.Name)
+		if err := c.download(fmt.Sprintf("/repos/%s/%s/actions/artifacts/%d/zip", repo.owner, repo.name, selected.ID), destination); err != nil {
+			fmt.Fprintln(os.Stderr, "Artifact download failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Artifact written to", destination)
+		return
 	}
 	useLogs := *includeLogs || (*autoLogs && (run.Conclusion == "failure" || run.Conclusion == "cancelled" || run.Conclusion == "timed_out" || run.Conclusion == "action_required"))
 	if err := writeExport(repo, run, items, useLogs, *output, c); err != nil {
