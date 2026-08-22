@@ -14,6 +14,19 @@ Then open <http://127.0.0.1:8000> in your browser.
 On Windows, you can double-click `run_github_actions_fetcher.bat` instead.
 On macOS/Linux, run `./run_github_actions_fetcher.sh`.
 
+## Windows standalone executable
+
+The **Python apps - Windows** GitHub Actions workflow builds two packages:
+
+- `github-actions-python-portable-windows-amd64.zip` — extract it and
+  double-click `GitHubActionsFetcher.exe`; no installation is needed.
+- `github-actions-python-installer-windows-amd64.exe` — installs both
+  applications and Start Menu shortcuts.
+
+Both packages include the Python runtime and standard library, so end users do
+not need to install Python. The workflow artifact also includes usage notes
+covering runtime environment variables and credential handling.
+
 You can enter the PAT in the form each time, or keep it out of the form by setting
 the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable before starting the app:
 

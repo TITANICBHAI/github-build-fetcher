@@ -1,0 +1,165 @@
+name: Build Python Windows executables
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Test and package Python applications
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.8"
+
+      - name: Install pinned packaging tool
+        run: python -m pip install --disable-pip-version-check "pyinstaller==6.11.1"
+
+      - name: Run syntax and import checks
+        run: |
+          python -m py_compile github_actions_fetcher.py push_current_code.py
+          python -c "import github_actions_fetcher, push_current_code; print('Standard-library imports passed')"
+
+      - name: Build one-file executables
+        run: |
+          python -m PyInstaller --noconfirm --clean --onefile --name GitHubActionsFetcher github_actions_fetcher.py
+          python -m PyInstaller --noconfirm --clean --onefile --name PushCurrentCode push_current_code.py
+
+      - name: Create artifact usage notes
+        shell: powershell
+        run: |
+          @'
+          # Windows Python packages
+
+          These applications include the Python runtime and standard-library code.
+          Python does not need to be installed separately.
+
+          ## Packages
+
+          - `github-actions-python-portable-windows-amd64.zip` — extract anywhere
+            and double-click `GitHubActionsFetcher.exe`. This package does not
+            modify the Windows installation.
+          - `github-actions-python-installer-windows-amd64.exe` — run the installer
+            to install both applications and Start Menu shortcuts. The installer
+            can be removed later from Windows Apps & features.
+
+          ## Executables
+
+          - `GitHubActionsFetcher.exe` — starts the browser-based GitHub Actions
+            fetcher. Open `http://127.0.0.1:8000` after starting it.
+          - `PushCurrentCode.exe` — runs the GitHub push helper. Use `--help` for
+            options, for example `PushCurrentCode.exe --dry-run` or
+            `PushCurrentCode.exe --watch --interval 60`.
+
+          ## Runtime environment
+
+          - `GITHUB_PERSONAL_ACCESS_TOKEN` — optional for the fetcher, required by
+            the push helper unless `--dry-run` is used. Supply it through the
+            Windows environment; never put credentials in source code or packages.
+          - `SESSION_SECRET` — optional for the fetcher. Set a stable random value
+            when persistent sessions are desired; otherwise the app generates a
+            process-local value.
+          - `HOST`, `PORT`, and `EXPORT_DIR` — optional fetcher configuration.
+
+          The build packages contain no credentials, OAuth client secrets, or tokens.
+          '@ | Set-Content -Path .\WINDOWS-EXECUTABLES.md -Encoding utf8
+
+      - name: Create portable ZIP package
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force -Path .\portable-package | Out-Null
+          Copy-Item .\dist\GitHubActionsFetcher.exe .\portable-package\
+          Copy-Item .\dist\PushCurrentCode.exe .\portable-package\
+          Copy-Item .\WINDOWS-EXECUTABLES.md .\portable-package\
+          Compress-Archive -Path .\portable-package\* -DestinationPath .\github-actions-python-portable-windows-amd64.zip
+
+      - name: Install pinned Inno Setup
+        shell: powershell
+        run: choco install innosetup --version=6.4.2 --no-progress --yes
+
+      - name: Build Windows installer package
+        shell: powershell
+        run: |
+          @'
+          [Setup]
+          AppId={{B8A1B4DA-7BD5-4B95-9C57-4B7A52B7B7E2}
+          AppName=GitHub Actions Python Utilities
+          AppVersion=1.0.0
+          DefaultDirName={autopf}\GitHub Actions Python Utilities
+          DefaultGroupName=GitHub Actions Python Utilities
+          OutputDir=.
+          OutputBaseFilename=github-actions-python-installer-windows-amd64
+          Compression=lzma
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64
+          UninstallDisplayName=GitHub Actions Python Utilities
+
+          [Files]
+          Source: "dist\GitHubActionsFetcher.exe"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "dist\PushCurrentCode.exe"; DestDir: "{app}"; Flags: ignoreversion
+          Source: "WINDOWS-EXECUTABLES.md"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\GitHub Actions Fetcher"; Filename: "{app}\GitHubActionsFetcher.exe"
+          Name: "{group}\Push Current Code"; Filename: "{app}\PushCurrentCode.exe"
+          Name: "{group}\Windows usage notes"; Filename: "{app}\WINDOWS-EXECUTABLES.md"
+          '@ | Set-Content -Path .\windows-installer.iss -Encoding ascii
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" .\windows-installer.iss
+
+      - name: Smoke-test packaged executables
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          & .\dist\PushCurrentCode.exe --help | Out-Host
+          if ($LASTEXITCODE -ne 0) {
+            throw "PushCurrentCode.exe --help failed with exit code $LASTEXITCODE"
+          }
+
+          $env:HOST = "127.0.0.1"
+          $env:PORT = "8765"
+          $env:SESSION_SECRET = "packaging-smoke-test-only"
+          $fetcher = Start-Process -FilePath .\dist\GitHubActionsFetcher.exe -PassThru -WindowStyle Hidden
+          try {
+            $ready = $false
+            1..20 | ForEach-Object {
+              if (-not $ready) {
+                Start-Sleep -Milliseconds 250
+                try {
+                  $response = Invoke-WebRequest -Uri http://127.0.0.1:8765/ -UseBasicParsing
+                  if ($response.StatusCode -eq 200 -and $response.Content -match "Actions Fetcher") {
+                    $ready = $true
+                  }
+                } catch {
+                  # The server may still be starting.
+                }
+              }
+            }
+            if (-not $ready) {
+              throw "GitHubActionsFetcher.exe did not serve its local page"
+            }
+          } finally {
+            if (-not $fetcher.HasExited) {
+              Stop-Process -Id $fetcher.Id -Force
+            }
+          }
+
+      - name: Upload Windows packages and usage notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: Python-apps-windows-amd64
+          path: |
+            github-actions-python-portable-windows-amd64.zip
+            github-actions-python-installer-windows-amd64.exe
+            WINDOWS-EXECUTABLES.md
+          if-no-files-found: error
+          retention-days: 30
