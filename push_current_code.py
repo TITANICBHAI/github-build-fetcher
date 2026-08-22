@@ -12,7 +12,9 @@ Examples:
 
 import argparse
 import base64
+import fnmatch
 import os
+import re
 import subprocess
 import sys
 import time
@@ -21,6 +23,20 @@ from urllib.parse import urlparse
 
 DEFAULT_REPOSITORY = "https://github.com/TITANICBHAI/github-build-fetcher"
 DEFAULT_BRANCH = "main"
+DEFAULT_AUTHOR_NAME = "GitHub Fetcher Bot"
+DEFAULT_AUTHOR_EMAIL = "github-fetcher-bot@users.noreply.github.com"
+MAX_FILE_SIZE = 10 * 1024 * 1024
+PROTECTED_NAMES = {
+    ".env", ".env.local", ".env.development", ".env.production",
+    "id_rsa", "id_ed25519", "credentials.json", "secrets.json",
+}
+PROTECTED_EXTENSIONS = (".pem", ".key", ".p12", ".pfx", ".sqlite", ".sqlite3", ".db")
+SECRET_PATTERNS = (
+    re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"),
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),
+    re.compile(r"BEGIN (RSA|OPENSSH|EC|PRIVATE) KEY"),
+    re.compile(r"(?i)(aws_access_key_id|private_key|client_secret)\s*[:=]"),
+)
 
 
 def run_git(*args, check=True):
@@ -62,17 +78,80 @@ def status_summary():
     return run_git("status", "--short").stdout.strip()
 
 
-def push_once(branch, message):
+def changed_files():
+    result = run_git("diff", "--name-only", "--cached")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def scan_files(files):
+    blocked = []
+    oversized = []
+    suspicious = []
+    for filename in files:
+        normalized = filename.replace("\\", "/")
+        base = os.path.basename(normalized).lower()
+        if base in PROTECTED_NAMES or base.endswith(PROTECTED_EXTENSIONS) or normalized.startswith(("data/exports/", ".local/")):
+            blocked.append(filename)
+            continue
+        try:
+            if os.path.getsize(filename) > MAX_FILE_SIZE:
+                oversized.append(filename)
+                continue
+            if os.path.isfile(filename) and os.path.getsize(filename) <= 2 * 1024 * 1024:
+                with open(filename, "r", encoding="utf-8", errors="ignore") as source:
+                    text = source.read()
+                if any(pattern.search(text) for pattern in SECRET_PATTERNS):
+                    suspicious.append(filename)
+        except OSError:
+            pass
+    return blocked, oversized, suspicious
+
+
+def push_once(branch, message, dry_run=False, confirm=False):
     token = validate_token()
     remote = repository_url()
     run_git("remote", "set-url", "origin", remote)
     run_git("add", "-A")
+    files = changed_files()
+    if not files:
+        print("No file changes to commit; pushing the current branch if needed.")
+    else:
+        blocked, oversized, suspicious = scan_files(files)
+        if blocked:
+            raise RuntimeError("Protected files detected; remove them from the commit: " + ", ".join(blocked))
+        if oversized:
+            raise RuntimeError(f"Files exceed the {MAX_FILE_SIZE // (1024 * 1024)} MB limit: " + ", ".join(oversized))
+        if suspicious:
+            raise RuntimeError("Possible credentials detected in: " + ", ".join(suspicious))
+        print("Files selected for push:")
+        for filename in files:
+            print(f"  {filename}")
+        if dry_run:
+            print("Dry run complete; nothing was committed or pushed.")
+            run_git("reset", check=False)
+            return
+        if confirm:
+            if not sys.stdin.isatty():
+                raise RuntimeError("Confirmation was requested, but this workflow has no interactive terminal.")
+            answer = input("Push these files to GitHub? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                run_git("reset", check=False)
+                print("Push cancelled.")
+                return
 
     staged = run_git("diff", "--cached", "--quiet", check=False)
     if staged.returncode == 0:
         print("No file changes to commit; pushing the current branch if needed.")
     elif staged.returncode == 1:
-        run_git("commit", "-m", message)
+        author_name = os.environ.get("GIT_PUSH_AUTHOR_NAME", DEFAULT_AUTHOR_NAME).strip()
+        author_email = os.environ.get("GIT_PUSH_AUTHOR_EMAIL", DEFAULT_AUTHOR_EMAIL).strip()
+        if not author_name or not author_email or any(char in author_email for char in "\r\n"):
+            raise RuntimeError("GIT_PUSH_AUTHOR_NAME and GIT_PUSH_AUTHOR_EMAIL must be valid.")
+        run_git(
+            "-c", f"user.name={author_name}",
+            "-c", f"user.email={author_email}",
+            "commit", "-m", message,
+        )
         print("Created a commit for the current project.")
     else:
         raise RuntimeError(staged.stderr.strip() or "Could not inspect staged changes.")
@@ -117,6 +196,8 @@ def main():
     parser.add_argument("--message", default="Update current Replit code")
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--dry-run", action="store_true", help="scan and list changes without committing or pushing")
+    parser.add_argument("--confirm", action="store_true", help="ask for confirmation before a manual push")
     args = parser.parse_args()
     if not args.branch or any(char.isspace() for char in args.branch):
         parser.error("--branch must be a single branch name")
@@ -128,9 +209,9 @@ def main():
             changes = status_summary()
             if changes:
                 print("Changes detected; pushing current code.")
-                push_once(args.branch, args.message)
+                push_once(args.branch, args.message, args.dry_run, args.confirm)
             elif not args.watch:
-                push_once(args.branch, args.message)
+                push_once(args.branch, args.message, args.dry_run, args.confirm)
             else:
                 print("No changes detected.")
         except (RuntimeError, OSError) as error:

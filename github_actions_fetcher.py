@@ -13,8 +13,10 @@ import json
 import os
 import re
 import secrets
+import threading
 import tempfile
 import time
+import uuid
 import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +35,8 @@ OAUTH_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
 sessions = {}
 oauth_states = {}
+jobs = {}
+jobs_lock = threading.Lock()
 
 
 def parse_repo(value):
@@ -72,6 +76,15 @@ def api_json(url, token):
     if len(data) > MAX_JSON:
         raise RuntimeError("GitHub returned an unexpectedly large response.")
     return json.loads(data.decode("utf-8"))
+
+
+def api_json_with_headers(url, token):
+    with github_request(url, token) as response:
+        data = response.read(MAX_JSON + 1)
+        headers = dict(response.headers.items())
+    if len(data) > MAX_JSON:
+        raise RuntimeError("GitHub returned an unexpectedly large response.")
+    return json.loads(data.decode("utf-8")), headers
 
 
 def token_from(payload):
@@ -225,7 +238,7 @@ def fetch_artifacts(owner, repo, token, run_id):
     return api_json(root + f"/actions/runs/{run_id}/artifacts?per_page=100", token).get("artifacts", [])
 
 
-def build_export(owner, repo, token, selector, workflow_id, include_logs, auto_fetch_failed):
+def build_export(owner, repo, token, selector, workflow_id, include_logs, auto_fetch_failed, progress=None, cancel=None):
     run = resolve_run(owner, repo, token, selector, workflow_id)
     artifacts = fetch_artifacts(owner, repo, token, run["id"])
     failed = run.get("conclusion") in ("failure", "cancelled", "timed_out", "action_required")
@@ -234,7 +247,11 @@ def build_export(owner, repo, token, selector, workflow_id, include_logs, auto_f
     with tempfile.TemporaryDirectory(prefix="github-actions-fetcher-") as folder:
         artifact_files = []
         for index, artifact in enumerate(artifacts, 1):
+            if cancel and cancel.is_set():
+                raise RuntimeError("The export was cancelled.")
             name = safe_name(artifact.get("name"), f"artifact-{index}")
+            if progress:
+                progress(f"Downloading artifact {index} of {len(artifacts)}: {name}")
             destination = os.path.join(folder, f"{index:03d}-{name}.zip")
             checksums["artifacts/" + name + ".zip"] = download_resumable(
                 artifact["archive_download_url"], token, destination, artifact.get("digest")
@@ -242,11 +259,17 @@ def build_export(owner, repo, token, selector, workflow_id, include_logs, auto_f
             artifact_files.append((name, destination))
         logs_path = None
         if pull_logs:
+            if cancel and cancel.is_set():
+                raise RuntimeError("The export was cancelled.")
+            if progress:
+                progress("Downloading workflow logs")
             logs_path = os.path.join(folder, "logs.zip")
             checksums["logs.zip"] = download_resumable(
                 repo_root(owner, repo) + f"/actions/runs/{run['id']}/logs", token, logs_path
             )
         output = io.BytesIO()
+        if progress:
+            progress("Creating verified export ZIP")
         with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as bundle:
             bundle.writestr("run.json", json.dumps(run, indent=2, ensure_ascii=False))
             bundle.writestr("checksums.json", json.dumps(checksums, indent=2))
@@ -323,6 +346,131 @@ def github_write(url, token, payload):
         return json.loads(response.read().decode("utf-8"))
 
 
+def github_mutation(url, token, payload, method):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "portable-github-actions-fetcher",
+        "Content-Type": "application/json",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method=method)
+    with urlopen(request, timeout=90) as response:
+        data = response.read(MAX_JSON + 1)
+        if len(data) > MAX_JSON:
+            raise RuntimeError("GitHub returned an unexpectedly large response.")
+        return json.loads(data.decode("utf-8")) if data else {}
+
+
+def get_rate_limit(owner, repo, token):
+    data, headers = api_json_with_headers(GITHUB_API + "/rate_limit", token)
+    repository, repo_headers = api_json_with_headers(repo_root(owner, repo), token)
+    scopes = [item.strip() for item in headers.get("X-OAuth-Scopes", "").split(",") if item.strip()]
+    return {
+        "remaining": data.get("resources", {}).get("core", {}).get("remaining"),
+        "limit": data.get("resources", {}).get("core", {}).get("limit"),
+        "reset": data.get("resources", {}).get("core", {}).get("reset"),
+        "authenticated": bool(token),
+        "repository": f"{owner}/{repo}",
+        "visibility": repository.get("visibility") or ("private" if repository.get("private") else "public"),
+        "scopes": scopes,
+        "permissions": {
+            "Actions read": "actions:read" in scopes or not token,
+            "Contents read": "repo" in scopes or "public_repo" in scopes or not token,
+            "Contents write": "repo" in scopes or not token,
+            "Pull requests write": "repo" in scopes or not token,
+        },
+        "header_authenticated": bool(repo_headers.get("X-OAuth-Scopes")),
+    }
+
+
+def list_branches(owner, repo, token):
+    branches = api_json(repo_root(owner, repo) + "/branches?per_page=100", token)
+    return [{"name": item.get("name"), "protected": item.get("protected", False)} for item in branches]
+
+
+def get_file(owner, repo, token, branch, path):
+    clean_path = str(path or "").strip().replace("\\", "/").lstrip("/")
+    if not clean_path or ".." in clean_path.split("/"):
+        raise ValueError("Enter a safe repository file path.")
+    url = repo_root(owner, repo) + "/contents/" + quote(clean_path, safe="/") + "?ref=" + quote(str(branch or "main"))
+    try:
+        return api_json(url, token)
+    except HTTPError as error:
+        if error.code == 404:
+            return None
+        raise
+
+
+def create_branch(owner, repo, token, branch, from_branch):
+    refs = api_json(repo_root(owner, repo) + "/git/ref/heads/" + quote(from_branch), token)
+    return github_mutation(
+        repo_root(owner, repo) + "/git/refs",
+        token,
+        {"ref": "refs/heads/" + branch, "sha": refs["object"]["sha"]},
+        "POST",
+    )
+
+
+def create_pull_request(owner, repo, token, title, body, head, base):
+    return github_mutation(
+        repo_root(owner, repo) + "/pulls",
+        token,
+        {"title": title, "body": body, "head": head, "base": base},
+        "POST",
+    )
+
+
+def update_job(job_id, **values):
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(values)
+
+
+def start_job(kind, operation):
+    job_id = uuid.uuid4().hex
+    cancel = threading.Event()
+    with jobs_lock:
+        jobs[job_id] = {
+            "id": job_id, "kind": kind, "status": "queued",
+            "message": "Waiting to start", "result": None, "error": None,
+            "created_at": time.time(), "cancel": cancel,
+        }
+
+    def worker():
+        update_job(job_id, status="running", message="Starting")
+        try:
+            result = operation(
+                lambda message: update_job(job_id, message=message),
+                cancel,
+            )
+            if cancel.is_set():
+                update_job(job_id, status="cancelled", message="Cancelled")
+            else:
+                update_job(job_id, status="completed", message="Completed", result=result)
+        except Exception as error:
+            update_job(job_id, status="failed", message="Failed", error=nice_error(error))
+
+    threading.Thread(target=worker, daemon=True, name=f"github-job-{job_id[:8]}").start()
+    return job_id
+
+
+def run_fetch_job(owner, repo, token, payload, workflow_id, progress, cancel):
+    archive, run, artifacts, logs = build_export(
+        owner, repo, token, payload.get("selector"), workflow_id,
+        bool(payload.get("logs")), bool(payload.get("auto")), progress, cancel,
+    )
+    filename = f"github-actions-{safe_name(owner, 'owner')}-{safe_name(repo, 'repo')}-run-{run.get('run_number', run.get('id'))}.zip"
+    saved = save_file(payload.get("save_to"), filename, archive)
+    download_token = persist_download(filename, archive)
+    return {
+        "filename": filename, "saved_path": saved,
+        "artifacts": len(artifacts), "logs": logs,
+        "download_url": f"/download/{download_token}",
+    }
+
+
 def push_file(owner, repo, token, branch, path, message, content, overwrite):
     branch = str(branch or "").strip()
     path = str(path or "").strip().replace("\\", "/").lstrip("/")
@@ -380,7 +528,8 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
 @media(max-width:740px){.grid{grid-template-columns:1fr}.wrap{padding-top:30px}.facts{grid-template-columns:1fr}}
 </style></head><body><main class="wrap"><div class="eyebrow">GitHub Actions utility</div><h1>Bring a build home.</h1>
 <p class="lead">Inspect workflows, choose a build, test access, and fetch exactly what you need — without Git, GitHub CLI, or extra Python packages.</p>
-<div class="authbar"><span id="authText">Public repositories work without login. OAuth is optional for private repositories.</span><span class="actions"><button id="login" class="secondary">Log in with GitHub</button><button id="logout" class="secondary" style="display:none">Log out</button><button id="revoke" class="secondary" style="display:none">Revoke GitHub access</button></span></div>
+ <div class="authbar"><span id="authText">Public repositories work without login. OAuth is optional for private repositories.</span><span class="actions"><button id="login" class="secondary">Log in with GitHub</button><button id="logout" class="secondary" style="display:none">Log out</button><button id="revoke" class="secondary" style="display:none">Revoke GitHub access</button></span></div>
+ <section class="card" style="margin-bottom:18px"><div class="legend">Access & API status</div><div class="actions"><button id="diagnostics" class="secondary">Check access and rate limit</button><button id="saveProfile" class="secondary">Save repository profile</button><button id="backupSettings" class="secondary">Backup settings</button><label class="secondary" style="padding:12px 15px;border-radius:10px;cursor:pointer">Restore settings<input id="restoreSettings" type="file" accept=".json" style="display:none"></label></div><div id="diagnosticsView" class="facts" style="margin-top:14px"></div></section>
 <section class="panel"><div class="field"><label for="repo">Repository link</label><input id="repo" placeholder="https://github.com/owner/repository" autocomplete="url"></div>
 <div class="field"><label for="pat">GitHub personal access token</label><input id="pat" type="password" placeholder="Leave blank if GITHUB_PERSONAL_ACCESS_TOKEN is set" autocomplete="off"><div class="hint">Only used in memory for the request. Never saved or put in an export.</div></div>
 <div class="actions"><button id="test" class="secondary">Test token & access</button><button id="inspect">Load workflows & builds</button></div><div id="status" class="status"></div></section>
@@ -390,10 +539,10 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
 <div class="field"><label for="selector">Specific run ID / number (optional)</label><input id="selector" inputmode="numeric" placeholder="e.g. 32551351734"></div>
 <div class="check"><input id="logs" type="checkbox"> <span>Include logs</span></div><div class="check"><input id="auto" type="checkbox" checked> <span>Auto-fetch logs if build failed</span></div>
 <div class="field"><label for="save">Save ZIP to folder (optional)</label><input id="save" placeholder="C:\Users\You\Downloads or /home/you/Downloads"><div class="hint">When filled, the server saves a copy there and still offers a browser download.</div></div>
-<div class="actions"><button id="download">Fetch selected build</button></div></section>
+ <div class="actions"><button id="download">Fetch selected build</button><button id="cancelJob" class="secondary" disabled>Cancel job</button></div></section>
 <section class="card"><div class="legend">Build summary</div><div id="empty" class="muted">Load the repository to see the latest 20 builds.</div><div id="summary" class="summary"><h2 id="summaryTitle"></h2><div id="facts" class="facts"></div></div><div class="builds" id="builds"></div></section></div>
  <section class="card" style="margin-top:18px"><div class="legend">Individual artifacts</div><div id="artifactHint" class="muted">Select a build to see its artifacts.</div><div id="artifacts"></div></section>
- <section class="card" style="margin-top:18px"><div class="legend">Push a file to GitHub</div><div class="muted">This creates one explicit commit. A PAT with Contents write access is required.</div><div class="grid" style="margin-top:14px"><div><div class="field"><label for="pushFile">File to upload</label><input id="pushFile" type="file"></div><div class="field"><label for="pushBranch">Target branch</label><input id="pushBranch" value="main" placeholder="main"></div><div class="field"><label for="pushPath">Repository path</label><input id="pushPath" placeholder="exports/build.zip"></div></div><div><div class="field"><label for="pushMessage">Commit message</label><input id="pushMessage" placeholder="Upload build export"></div><div class="check"><input id="overwrite" type="checkbox"> <span>Allow overwrite of an existing file</span></div><div class="actions"><button id="push" class="secondary">Create GitHub commit</button></div></div></div><div id="pushStatus" class="muted" style="margin-top:12px"></div></section>
+ <section class="card" style="margin-top:18px"><div class="legend">Push a file to GitHub</div><div class="muted">This creates one explicit commit. A PAT with Contents write access is required.</div><div class="grid" style="margin-top:14px"><div><div class="field"><label for="pushFile">File to upload</label><input id="pushFile" type="file"></div><div class="field"><label for="pushBranch">Target branch</label><input id="pushBranch" value="main" placeholder="main"><button id="loadBranches" class="secondary" style="margin-top:8px">Load branches</button></div><div class="field"><label for="branchSelect">Known branches</label><select id="branchSelect"><option value="">Load branches first</option></select></div><div class="field"><label for="pushPath">Repository path</label><input id="pushPath" placeholder="exports/build.zip"><button id="checkFile" class="secondary" style="margin-top:8px">Check existing file</button></div></div><div><div class="field"><label for="pushMessage">Commit message</label><input id="pushMessage" placeholder="Upload build export"></div><div class="check"><input id="overwrite" type="checkbox"> <span>Allow overwrite of an existing file</span></div><div class="actions"><button id="push" class="secondary">Create GitHub commit</button></div><div class="field" style="margin-top:14px"><label for="newBranch">Create branch from target branch (optional)</label><input id="newBranch" placeholder="exports/my-change"><button id="createBranch" class="secondary" style="margin-top:8px">Create branch</button></div><div class="field"><label for="prTitle">Pull request title (optional)</label><input id="prTitle" placeholder="Propose uploaded change"></div><div class="field"><label for="prBody">Pull request description</label><input id="prBody" placeholder="What changed?"></div><div class="actions"><button id="createPr" class="secondary">Create pull request</button></div></div></div><div id="fileStatus" class="muted" style="margin-top:12px"></div><div id="pushStatus" class="muted" style="margin-top:12px"></div></section>
  <section class="card" style="margin-top:18px"><div class="legend">Compare commits</div><div class="muted">Load a repository, then select 2–6 commits to compare together.</div><div id="commitHistory" class="builds"></div><div class="actions"><button id="compare" class="secondary">Compare selected commits</button></div><div id="comparison" class="builds"></div></section>
 <footer>Exports include run.json, checksums.json, README.txt, artifacts, and optional logs. Temporary files are cleaned up automatically after each request.</footer></main>
 <script>
@@ -404,7 +553,7 @@ $('login').onclick=()=>{location.href='/oauth/login'};$('logout').onclick=()=>{l
 function summary(run){$('empty').style.display='none';$('summary').className='summary show';$('summaryTitle').textContent=(run.name||'Workflow')+' · build #'+(run.run_number||'—');const vals=[['Status',run.conclusion||run.status||'—'],['Branch',run.branch||'—'],['Commit',run.commit||'—'],['Author',run.author||'—'],['Event',run.event||'—'],['Message',run.message||'—']];$('facts').innerHTML=vals.map(x=>'<div class="fact"><span>'+x[0]+'</span><b>'+esc(x[1])+'</b></div>').join('')}
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
  function renderRuns(){const branch=($('branchFilter')?.value||'').toLowerCase(),status=($('statusFilter')?.value||'').toLowerCase(),event=($('eventFilter')?.value||'').toLowerCase(),name=($('nameFilter')?.value||'').toLowerCase(),since=$('dateFilter')?.value||'';const runs=state.runs.filter(r=>(!branch||(r.branch||'').toLowerCase().includes(branch))&&(!status||String(r.conclusion||r.status||'').toLowerCase()===status)&&(!event||String(r.event||'').toLowerCase()===event)&&(!name||(r.name||'').toLowerCase().includes(name))&&(!since||String(r.created_at||'').slice(0,10)>=since));$('build').disabled=!runs.length;$('build').innerHTML='<option value="">Latest visible build</option>'+runs.map(r=>'<option value="'+r.id+'">#'+r.run_number+' · '+esc(r.name||'workflow')+' · '+esc(r.conclusion||r.status)+'</option>').join('');$('builds').innerHTML=runs.length?runs.map(r=>'<div class="build" data-id="'+r.id+'"><div><strong>#'+r.run_number+' · '+esc(r.name||'Workflow')+'</strong><small>'+esc(r.branch||'no branch')+' · '+esc((r.commit||'').slice(0,12))+' · '+esc(r.author||'unknown')+'</small></div><span class="pill '+(r.conclusion==='success'?'success':r.conclusion?'failure':'')+'">'+esc(r.conclusion||r.status||'unknown')+'</span></div>').join(''):'<div class="muted">No builds match these filters.</div>';document.querySelectorAll('#builds .build').forEach(x=>x.onclick=()=>selectRun(state.runs.find(r=>String(r.id)===x.dataset.id)))}
-function selectRun(r){$('selector').value=r.id;summary(r);loadArtifacts(r.id)}
+ function selectRun(r){if(!r)return;$('selector').value=r.id;summary(r);loadArtifacts(r.id)}
 async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const x=r.headers.get('content-type')?.includes('json')?await r.json():null;if(!r.ok)throw Error(x?.error||'Request failed');return x}
 async function inspect(testOnly=false){if(!$('repo').value.trim())throw Error('Enter a repository link first.');const data=await post(testOnly?'/test':'/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value});if(testOnly){message('Token works and the repository is accessible.','ok');return}
 const w=$('workflow');w.disabled=false;w.innerHTML='<option value="">All workflows</option>'+data.workflows.map(x=>'<option value="'+x.id+'">'+esc(x.name)+' ('+esc(x.state)+')</option>').join('');state.runs=data.runs.map(x=>x.summary);renderRuns();if(state.runs[0])selectRun(state.runs[0]);message('Loaded '+state.runs.length+' recent builds and '+data.workflows.length+' workflows.','ok')}
@@ -420,9 +569,18 @@ $('workflow').onchange=async()=>{try{message('Loading builds for this workflow�
 $('build').onchange=()=>{const r=state.runs.find(x=>String(x.id)===$('build').value);if(r)selectRun(r)};
  function startProgress(){let n=0;clearInterval(state.progressTimer);state.progressTimer=setInterval(()=>{n=(n+1)%4;message(['Contacting GitHub…','Downloading artifacts…','Verifying checksums…','Preparing browser download…'][n]);},900)}
  function stopProgress(){clearInterval(state.progressTimer);state.progressTimer=null}
- $('download').onclick=async()=>{try{$('download').disabled=true;startProgress();const data=await post('/fetch',{repo:$('repo').value,pat:token(),selector:$('selector').value||$('build').value,workflow_id:$('workflow').value,logs:$('logs').checked,auto:$('auto').checked,save_to:$('save').value});stopProgress();saveResponse(data,'bundle');message('Build bundle ready. '+data.artifacts+' artifact(s) included'+(data.logs?' and logs.':'.'),'ok')}catch(e){stopProgress();message(e.message,'error')}finally{$('download').disabled=false}};
+  async function pollJob(id){state.jobId=id;$('cancelJob').disabled=false;while(true){const s=await post('/job/status',{job_id:id});message(s.message,s.status==='failed'?'error':'ok');if(s.status==='completed'){state.jobId=null;$('cancelJob').disabled=true;return s.result}if(s.status==='failed'||s.status==='cancelled'){state.jobId=null;$('cancelJob').disabled=true;throw Error(s.error||s.message)}await new Promise(resolve=>setTimeout(resolve,700))}}
+  $('cancelJob').onclick=async()=>{if(state.jobId)await post('/job/cancel',{job_id:state.jobId}).catch(e=>message(e.message,'error'))};
+  $('download').onclick=async()=>{try{$('download').disabled=true;const job=await post('/job/start',{kind:'fetch',repo:$('repo').value,pat:token(),selector:$('selector').value||$('build').value,workflow_id:$('workflow').value,logs:$('logs').checked,auto:$('auto').checked,save_to:$('save').value});const data=await pollJob(job.job_id);saveResponse(data,'bundle');message('Build bundle ready. '+data.artifacts+' artifact(s) included'+(data.logs?' and logs.':'.'),'ok')}catch(e){message(e.message,'error')}finally{$('download').disabled=false;$('cancelJob').disabled=true}};
  function refresh(){if(!$('repo').value.trim())return;post('/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value}).then(data=>{state.runs=data.runs.map(x=>x.summary);renderRuns();message('Build list refreshed.','ok')}).catch(e=>message(e.message,'error'))}
- $('push').onclick=async()=>{const file=$('pushFile').files[0];if(!file){$('pushStatus').textContent='Choose a file first.';return}if(file.size>9*1024*1024){$('pushStatus').textContent='The file must be smaller than 9 MB.';return}try{$('push').disabled=true;$('pushStatus').textContent='Reading file and creating commit…';const bytes=new Uint8Array(await file.arrayBuffer());let binary='';bytes.forEach(x=>binary+=String.fromCharCode(x));const data=await post('/push',{repo:$('repo').value,pat:token(),branch:$('pushBranch').value,path:$('pushPath').value||file.name,message:$('pushMessage').value,overwrite:$('overwrite').checked,content:btoa(binary)});$('pushStatus').textContent='Committed '+data.path+' to '+data.branch+'.';if(data.url)window.open(data.url,'_blank','noopener')}catch(e){$('pushStatus').textContent=e.message}finally{$('push').disabled=false}};
+  $('push').onclick=async()=>{const file=$('pushFile').files[0];if(!file){$('pushStatus').textContent='Choose a file first.';return}if(file.size>9*1024*1024){$('pushStatus').textContent='The file must be smaller than 9 MB.';return}try{$('push').disabled=true;$('pushStatus').textContent='Reading file and creating background commit…';const bytes=new Uint8Array(await file.arrayBuffer());let binary='';bytes.forEach(x=>binary+=String.fromCharCode(x));const job=await post('/job/start',{kind:'push',repo:$('repo').value,pat:token(),branch:$('pushBranch').value,path:$('pushPath').value||file.name,message:$('pushMessage').value,overwrite:$('overwrite').checked,content:btoa(binary)});const data=await pollJob(job.job_id);$('pushStatus').textContent='Committed '+data.path+' to '+data.branch+'.';if(data.url)window.open(data.url,'_blank','noopener')}catch(e){$('pushStatus').textContent=e.message}finally{$('push').disabled=false}};
+  $('diagnostics').onclick=async()=>{try{const d=await post('/rate-limit',{repo:$('repo').value,pat:token()});const reset=d.reset?new Date(d.reset*1000).toLocaleString():'unknown';$('diagnosticsView').innerHTML='<div class="fact"><span>Authentication</span><b>'+esc(d.authenticated?'Credential supplied':'Public access')+'</b></div><div class="fact"><span>Repository</span><b>'+esc(d.repository)+' · '+esc(d.visibility)+'</b></div><div class="fact"><span>API remaining</span><b>'+esc(d.remaining)+' / '+esc(d.limit)+' · resets '+esc(reset)+'</b></div>'+Object.entries(d.permissions).map(([k,v])=>'<div class="fact"><span>'+esc(k)+'</span><b>'+esc(v?'Available':'Not confirmed')+'</b></div>').join('');}catch(e){$('diagnosticsView').innerHTML='<div class="fact"><span>Access check</span><b>'+esc(e.message)+'</b></div>'}};
+  $('loadBranches').onclick=async()=>{try{const d=await post('/branches',{repo:$('repo').value,pat:token()});$('branchSelect').innerHTML=d.branches.map(b=>'<option value="'+esc(b.name)+'">'+esc(b.name)+(b.protected?' (protected)':'')+'</option>').join('');$('fileStatus').textContent='Loaded '+d.branches.length+' branches.'}catch(e){$('fileStatus').textContent=e.message}};
+  $('branchSelect').onchange=()=>{$('pushBranch').value=$('branchSelect').value};
+  $('checkFile').onclick=async()=>{try{const d=await post('/file',{repo:$('repo').value,pat:token(),branch:$('pushBranch').value,path:$('pushPath').value});$('fileStatus').textContent=d.exists?'Existing file: '+d.size+' bytes, SHA '+d.sha+'. Overwrite is '+($('overwrite').checked?'enabled':'disabled')+'.':'No existing file found; this will create a new file.'}catch(e){$('fileStatus').textContent=e.message}};
+  $('createBranch').onclick=async()=>{try{const branch=$('newBranch').value.trim();const d=await post('/create-branch',{repo:$('repo').value,pat:token(),branch,from_branch:$('pushBranch').value});$('pushBranch').value=branch;$('fileStatus').textContent='Created branch '+d.branch+'. Uploads can now target it.'}catch(e){$('fileStatus').textContent=e.message}};
+  $('createPr').onclick=async()=>{try{const d=await post('/create-pr',{repo:$('repo').value,pat:token(),title:$('prTitle').value,body:$('prBody').value,head:$('newBranch').value||$('pushBranch').value,base:$('pushBranch').value});$('fileStatus').textContent='Pull request created.';if(d.url)window.open(d.url,'_blank','noopener')}catch(e){$('fileStatus').textContent=e.message}};
+  const profileFields=['repo','workflow','branchFilter','statusFilter','eventFilter','nameFilter','dateFilter','pushBranch','pushPath','pushMessage'];function profile(){const p={};profileFields.forEach(id=>{const x=$(id);if(x)p[id]=x.value});return p}function applyProfile(p){profileFields.forEach(id=>{if(p[id]!==undefined&&$(id))$(id).value=p[id]});renderRuns()}$('saveProfile').onclick=()=>{localStorage.setItem('github-fetcher-profile',JSON.stringify(profile()));message('Repository profile saved locally.','ok')};$('backupSettings').onclick=()=>{const blob=new Blob([JSON.stringify({version:1,profile:profile()},null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='github-fetcher-settings.json';a.click();URL.revokeObjectURL(a.href)};$('restoreSettings').onchange=async()=>{const file=$('restoreSettings').files[0];if(!file)return;try{const data=JSON.parse(await file.text());if(data.profile?.pat||data.pat)throw Error('Credential data is not allowed in settings backups.');applyProfile(data.profile||data);message('Settings restored locally.','ok')}catch(e){message(e.message,'error')}};try{const saved=JSON.parse(localStorage.getItem('github-fetcher-profile')||'null');if(saved)applyProfile(saved)}catch(e){}
  ['branchFilter','statusFilter','eventFilter','nameFilter','dateFilter'].forEach(id=>$(id)?.addEventListener('input',renderRuns));$('refresh').onclick=refresh;$('autoRefresh').onchange=()=>{clearInterval(state.refreshTimer);if($('autoRefresh').checked)state.refreshTimer=setInterval(refresh,30000)};
 $('compare').onclick=async()=>{try{const selected=[...document.querySelectorAll('#commitHistory input:checked')].map(x=>x.value);const x=await post('/compare',{repo:$('repo').value,pat:token(),commits:selected});$('comparison').innerHTML=x.comparisons.map(c=>'<div class="build"><div><strong>'+c.base+' → '+c.head+'</strong><small>'+c.commits+' commit(s) · '+c.files+' changed file(s) · '+c.status+'</small></div><span class="pill">'+c.ahead_by+' ahead</span></div>').join('')}catch(e){message(e.message,'error')}};
 authState();
@@ -435,7 +593,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def json_body(self):
         length = int(self.headers.get("Content-Length", "0"))
-        if length > 30_000:
+        if length > 14_000_000:
             raise ValueError("Request is too large.")
         return json.loads(self.rfile.read(length))
 
@@ -510,6 +668,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         try:
             payload = self.json_body()
+            if self.path == "/job/status":
+                job_id = str(payload.get("job_id", ""))
+                with jobs_lock:
+                    job = jobs.get(job_id)
+                    if not job:
+                        raise ValueError("That background job was not found or has expired.")
+                    result = {key: value for key, value in job.items() if key != "cancel"}
+                self.respond(HTTPStatus.OK, result)
+                return
+            if self.path == "/job/cancel":
+                job_id = str(payload.get("job_id", ""))
+                with jobs_lock:
+                    job = jobs.get(job_id)
+                    if not job:
+                        raise ValueError("That background job was not found or has expired.")
+                    job["cancel"].set()
+                self.respond(HTTPStatus.OK, {"ok": True, "message": "Cancellation requested."})
+                return
             session = session_for(self)
             token = token_from(payload) or (session["token"] if session else "")
             validate_token(token)
@@ -546,6 +722,62 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/inspect":
                 workflows, runs = get_workflows_and_runs(owner, repo, token, workflow_id)
                 self.respond(HTTPStatus.OK, {"workflows": workflows, "runs": [{"summary": run_summary(r), "raw": r} for r in runs]})
+                return
+            if self.path == "/rate-limit":
+                self.respond(HTTPStatus.OK, get_rate_limit(owner, repo, token))
+                return
+            if self.path == "/branches":
+                self.respond(HTTPStatus.OK, {"branches": list_branches(owner, repo, token)})
+                return
+            if self.path == "/file":
+                file_data = get_file(owner, repo, token, payload.get("branch"), payload.get("path"))
+                if not file_data:
+                    self.respond(HTTPStatus.OK, {"exists": False})
+                    return
+                self.respond(HTTPStatus.OK, {
+                    "exists": True, "sha": file_data.get("sha"),
+                    "size": file_data.get("size"), "name": file_data.get("name"),
+                    "html_url": file_data.get("html_url"),
+                })
+                return
+            if self.path == "/create-branch":
+                branch = str(payload.get("branch", "")).strip()
+                base = str(payload.get("from_branch", "main")).strip()
+                if not re.match(r"^[A-Za-z0-9._/-]+$", branch) or branch.startswith("refs/"):
+                    raise ValueError("Enter a valid new branch name.")
+                if branch == base:
+                    raise ValueError("The new branch must have a different name from its base branch.")
+                result = create_branch(owner, repo, token, branch, base)
+                self.respond(HTTPStatus.OK, {"branch": branch, "sha": result.get("object", {}).get("sha")})
+                return
+            if self.path == "/create-pr":
+                title = str(payload.get("title", "")).strip()
+                base = str(payload.get("base", "")).strip()
+                head = str(payload.get("head", "")).strip()
+                if not title or not base or not head:
+                    raise ValueError("Enter a pull request title, source branch, and base branch.")
+                result = create_pull_request(owner, repo, token, title, payload.get("body", ""), head, base)
+                self.respond(HTTPStatus.OK, {"url": result.get("html_url"), "number": result.get("number")})
+                return
+            if self.path == "/job/start":
+                job_kind = str(payload.get("kind", "")).strip()
+                if job_kind == "fetch":
+                    job_id = start_job("fetch", lambda progress, cancel: run_fetch_job(
+                        owner, repo, token, payload, workflow_id, progress, cancel,
+                    ))
+                elif job_kind == "push":
+                    encoded = str(payload.get("content", "") or "")
+                    try:
+                        base64.b64decode(encoded, validate=True)
+                    except (ValueError, TypeError):
+                        raise ValueError("The selected file could not be read.")
+                    job_id = start_job("push", lambda progress, cancel: push_file(
+                        owner, repo, token, payload.get("branch"), payload.get("path"),
+                        payload.get("message"), encoded, bool(payload.get("overwrite")),
+                    ))
+                else:
+                    raise ValueError("Unknown background job type.")
+                self.respond(HTTPStatus.OK, {"job_id": job_id})
                 return
             if self.path == "/artifacts":
                 artifacts = fetch_artifacts(owner, repo, token, int(payload.get("run_id")))
