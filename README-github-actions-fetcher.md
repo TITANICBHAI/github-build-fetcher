@@ -10,6 +10,26 @@ python github_actions_fetcher.py
 
 Open <http://127.0.0.1:8765>.
 
+You can enter the PAT in the form each time, or keep it out of the form by setting
+the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable before starting the app:
+
+**Windows PowerShell**
+
+```powershell
+$env:GITHUB_PERSONAL_ACCESS_TOKEN = "your-token"
+python github_actions_fetcher.py
+```
+
+**macOS/Linux**
+
+```bash
+export GITHUB_PERSONAL_ACCESS_TOKEN="your-token"
+python3 github_actions_fetcher.py
+```
+
+When using the environment-variable method, leave the token field blank. Never put
+the token directly into this Python file or commit it to Git.
+
 ## What it does
 
 - Uses the latest workflow run by default.

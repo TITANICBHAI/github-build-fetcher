@@ -87,10 +87,17 @@ def nice_error(error):
 def build_export(owner, repo, token, build_number, include_logs, auto_fetch_failed):
     root = f"{GITHUB_API}/repos/{owner}/{repo}"
     if build_number:
-        runs = api_json(root + "/actions/runs?per_page=100", token).get("workflow_runs", [])
-        run = next((item for item in runs if str(item.get("run_number")) == str(build_number)), None)
-        if not run:
-            raise ValueError("No build with that run number was found in the latest 100 runs.")
+        # A GitHub Actions URL contains the run ID, while the Actions UI also
+        # shows a smaller run number. Accept either one.
+        try:
+            run = api_json(root + f"/actions/runs/{build_number}", token)
+        except HTTPError as error:
+            if error.code != 404:
+                raise
+            runs = api_json(root + "/actions/runs?per_page=100", token).get("workflow_runs", [])
+            run = next((item for item in runs if str(item.get("run_number")) == str(build_number)), None)
+            if not run:
+                raise ValueError("No build with that run ID or run number was found.")
     else:
         runs = api_json(root + "/actions/runs?per_page=1", token).get("workflow_runs", [])
         if not runs:
@@ -172,8 +179,8 @@ footer{color:#71819d;font-size:12px;margin-top:22px}@media(max-width:560px){.wra
 <p class="lead">Fetch a workflow run, its downloadable artifacts, and the logs you need — without Git, GitHub CLI, or any extra Python packages.</p>
 <section class="panel"><form id="form">
 <div class="field"><label for="repo">Repository link</label><input id="repo" name="repo" type="text" placeholder="https://github.com/owner/repository" required autocomplete="url"></div>
-<div class="field"><label for="pat">GitHub personal access token</label><input id="pat" name="pat" type="password" placeholder="ghp_… or github_pat_…" required autocomplete="off"><div class="hint">Used only for this request, then discarded. It is never saved or included in the export.</div></div>
-<div class="row"><div class="field"><label for="build">Build selection</label><input id="build" name="build" type="text" inputmode="numeric" placeholder="Leave blank for latest"><div class="hint">Enter the Actions run number for a specific build.</div></div><div class="field"><label>What to fetch</label><label class="choice"><input id="logs" name="logs" type="checkbox"> Include logs</label><label class="choice"><input id="auto" name="auto" type="checkbox" checked> Auto-fetch logs if build failed</label></div></div>
+<div class="field"><label for="pat">GitHub personal access token</label><input id="pat" name="pat" type="password" placeholder="ghp_… or github_pat_…" autocomplete="off"><div class="hint">Used only for this request, then discarded. You can leave this blank when GITHUB_PERSONAL_ACCESS_TOKEN is set in your environment.</div></div>
+<div class="row"><div class="field"><label for="build">Build selection</label><input id="build" name="build" type="text" inputmode="numeric" placeholder="Leave blank for latest"><div class="hint">Enter either the run ID from the GitHub URL or the Actions run number.</div></div><div class="field"><label>What to fetch</label><label class="choice"><input id="logs" name="logs" type="checkbox"> Include logs</label><label class="choice"><input id="auto" name="auto" type="checkbox" checked> Auto-fetch logs if build failed</label></div></div>
 <button id="submit" type="submit">Fetch build bundle</button><div id="status" class="status"></div>
 </form><div class="security">⌁ <span>Secure by design: HTTPS is used for GitHub, the token stays in memory, and this local app binds to your computer only.</span></div></section>
 <footer>Exports include run.json, a README, each artifact ZIP, and logs.zip when applicable.</footer>
@@ -221,7 +228,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("Request is too large.")
             payload = json.loads(self.rfile.read(length))
             owner, repo = parse_repo(payload.get("repo", ""))
-            token = str(payload.get("pat", "")).strip()
+            token = str(payload.get("pat", "")).strip() or os.environ.get("GITHUB_PERSONAL_ACCESS_TOKEN", "").strip()
             if not token or len(token) > 500 or any(c.isspace() for c in token):
                 raise ValueError("Enter a valid GitHub PAT.")
             build = str(payload.get("build", "")).strip()
