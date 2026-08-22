@@ -57,6 +57,24 @@ type workflowRun struct {
 		Login string `json:"login"`
 	} `json:"actor"`
 }
+type workflow struct {
+	ID    int64  `json:"id"`
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+type job struct {
+	Name        string `json:"name"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	HTMLURL     string `json:"html_url"`
+	StartedAt   string `json:"started_at"`
+	CompletedAt string `json:"completed_at"`
+	Steps       []struct {
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+	} `json:"steps"`
+}
 type artifact struct {
 	ID       int64  `json:"id"`
 	Name     string `json:"name"`
@@ -127,11 +145,22 @@ func (c *client) mutate(method, endpoint string, payload any, target any) error 
 	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(target)
 }
 
-func (c *client) runs(repo repoRef, selector string) ([]workflowRun, error) {
+func (c *client) workflows(repo repoRef) ([]workflow, error) {
+	var payload struct {
+		Workflows []workflow `json:"workflows"`
+	}
+	endpoint := fmt.Sprintf("/repos/%s/%s/actions/workflows?per_page=100", repo.owner, repo.name)
+	return payload.Workflows, c.json(endpoint, &payload)
+}
+
+func (c *client) runs(repo repoRef, selector string, workflowID int64) ([]workflowRun, error) {
 	var payload struct {
 		Runs []workflowRun `json:"workflow_runs"`
 	}
 	endpoint := fmt.Sprintf("/repos/%s/%s/actions/runs?per_page=20", url.PathEscape(repo.owner), url.PathEscape(repo.name))
+	if workflowID > 0 {
+		endpoint = fmt.Sprintf("/repos/%s/%s/actions/workflows/%d/runs?per_page=20", repo.owner, repo.name, workflowID)
+	}
 	if err := c.json(endpoint, &payload); err != nil {
 		return nil, err
 	}
@@ -148,6 +177,94 @@ func (c *client) runs(repo repoRef, selector string) ([]workflowRun, error) {
 		}
 	}
 	return nil, fmt.Errorf("run %s was not found in the latest 20 runs", selector)
+}
+
+func (c *client) runJobs(repo repoRef, runID int64) ([]job, error) {
+	var payload struct {
+		Jobs []job `json:"jobs"`
+	}
+	endpoint := fmt.Sprintf("/repos/%s/%s/actions/runs/%d/jobs?per_page=100", repo.owner, repo.name, runID)
+	return payload.Jobs, c.json(endpoint, &payload)
+}
+
+func (c *client) rateLimit(repo repoRef) (map[string]any, error) {
+	var limit struct {
+		Resources struct {
+			Core struct {
+				Limit     int64 `json:"limit"`
+				Remaining int64 `json:"remaining"`
+				Reset     int64 `json:"reset"`
+			} `json:"core"`
+		} `json:"resources"`
+	}
+	if err := c.json("/rate_limit", &limit); err != nil {
+		return nil, err
+	}
+	var repository struct {
+		Visibility string `json:"visibility"`
+		Private    bool   `json:"private"`
+	}
+	if err := c.json(fmt.Sprintf("/repos/%s/%s", repo.owner, repo.name), &repository); err != nil {
+		return nil, err
+	}
+	visibility := repository.Visibility
+	if visibility == "" {
+		if repository.Private {
+			visibility = "private"
+		} else {
+			visibility = "public"
+		}
+	}
+	return map[string]any{
+		"remaining":     limit.Resources.Core.Remaining,
+		"limit":         limit.Resources.Core.Limit,
+		"reset":         time.Unix(limit.Resources.Core.Reset, 0).UTC().Format(time.RFC3339),
+		"repository":    repo.owner + "/" + repo.name,
+		"visibility":    visibility,
+		"authenticated": c.token != "",
+	}, nil
+}
+
+func (c *client) branches(repo repoRef) ([]struct {
+	Name      string `json:"name"`
+	Protected bool   `json:"protected"`
+}, error) {
+	var branches []struct {
+		Name      string `json:"name"`
+		Protected bool   `json:"protected"`
+	}
+	return branches, c.json(fmt.Sprintf("/repos/%s/%s/branches?per_page=100", repo.owner, repo.name), &branches)
+}
+
+func (c *client) compare(repo repoRef, base, head string) (map[string]any, error) {
+	var result map[string]any
+	err := c.json(fmt.Sprintf("/repos/%s/%s/compare/%s...%s", repo.owner, repo.name, url.PathEscape(base), url.PathEscape(head)), &result)
+	return result, err
+}
+
+func (c *client) createBranch(repo repoRef, branch, from string) error {
+	var source struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
+	}
+	if err := c.json(fmt.Sprintf("/repos/%s/%s/git/ref/heads/%s", repo.owner, repo.name, url.PathEscape(from)), &source); err != nil {
+		return err
+	}
+	var created map[string]any
+	return c.mutate(http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/refs", repo.owner, repo.name), map[string]string{
+		"ref": "refs/heads/" + branch, "sha": source.Object.SHA,
+	}, &created)
+}
+
+func (c *client) createPR(repo repoRef, title, body, head, base string) (string, error) {
+	var result struct {
+		URL string `json:"html_url"`
+	}
+	err := c.mutate(http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", repo.owner, repo.name), map[string]string{
+		"title": title, "body": body, "head": head, "base": base,
+	}, &result)
+	return result.URL, err
 }
 
 func (c *client) artifacts(repo repoRef, runID int64) ([]artifact, error) {
@@ -428,10 +545,23 @@ func prompt(message string) string {
 func main() {
 	repoArg := flag.String("repo", "", "GitHub repository URL")
 	runArg := flag.String("run", "", "run ID or run number; defaults to latest")
+	workflowArg := flag.Int64("workflow", 0, "workflow ID to inspect")
 	output := flag.String("output", "", "write a ZIP export to this path")
 	includeLogs := flag.Bool("logs", false, "include workflow logs")
+	autoLogs := flag.Bool("auto-logs", true, "include logs automatically for failed runs")
 	inspect := flag.Bool("inspect", true, "list recent workflow runs")
 	scan := flag.Bool("scan", false, "scan the current directory for protected files and secrets")
+	details := flag.Bool("details", false, "show jobs and step status for the selected run")
+	diagnostics := flag.Bool("diagnostics", false, "show API rate limit and repository visibility")
+	listBranches := flag.Bool("branches", false, "list repository branches")
+	compareBase := flag.String("compare-base", "", "base commit or branch for comparison")
+	compareHead := flag.String("compare-head", "", "head commit or branch for comparison")
+	createBranchArg := flag.String("create-branch", "", "create a branch from --from-branch")
+	fromBranch := flag.String("from-branch", "main", "source branch for --create-branch")
+	prTitle := flag.String("pr-title", "", "create a pull request with this title")
+	prBody := flag.String("pr-body", "", "pull request description")
+	prHead := flag.String("pr-head", "", "pull request source branch")
+	prBase := flag.String("pr-base", "main", "pull request target branch")
 	tokenArg := flag.String("token", "", "GitHub token (prefer GITHUB_PERSONAL_ACCESS_TOKEN)")
 	upload := flag.String("upload", "", "local file to upload through the GitHub Contents API")
 	uploadPath := flag.String("path", "", "repository path for --upload")
@@ -475,7 +605,61 @@ func main() {
 		}
 		return
 	}
-	runs, err := c.runs(repo, *runArg)
+	if *diagnostics {
+		info, err := c.rateLimit(repo)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Diagnostics failed:", err)
+			os.Exit(1)
+		}
+		encoded, _ := json.MarshalIndent(info, "", "  ")
+		fmt.Println(string(encoded))
+	}
+	if *listBranches {
+		branches, err := c.branches(repo)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Branch listing failed:", err)
+			os.Exit(1)
+		}
+		for _, item := range branches {
+			marker := ""
+			if item.Protected {
+				marker = " (protected)"
+			}
+			fmt.Println(item.Name + marker)
+		}
+	}
+	if *createBranchArg != "" {
+		if err := c.createBranch(repo, *createBranchArg, *fromBranch); err != nil {
+			fmt.Fprintln(os.Stderr, "Branch creation failed:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Created branch %s from %s.\n", *createBranchArg, *fromBranch)
+	}
+	if *prTitle != "" {
+		if *prHead == "" {
+			fmt.Fprintln(os.Stderr, "--pr-head is required with --pr-title")
+			os.Exit(2)
+		}
+		link, err := c.createPR(repo, *prTitle, *prBody, *prHead, *prBase)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Pull request creation failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Pull request created:", link)
+	}
+	if *compareBase != "" || *compareHead != "" {
+		if *compareBase == "" || *compareHead == "" {
+			fmt.Fprintln(os.Stderr, "--compare-base and --compare-head are both required")
+			os.Exit(2)
+		}
+		result, err := c.compare(repo, *compareBase, *compareHead)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Comparison failed:", err)
+			os.Exit(1)
+		}
+		fmt.Printf("%s → %s: %v commits, %v files, %v ahead\n", *compareBase, *compareHead, result["total_commits"], result["changed_files"], result["ahead_by"])
+	}
+	runs, err := c.runs(repo, *runArg, *workflowArg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -491,6 +675,9 @@ func main() {
 		}
 	}
 	if len(runs) == 0 || *output == "" {
+		if *details && len(runs) > 0 {
+			showDetails(c, repo, runs[0])
+		}
 		return
 	}
 	run := runs[0]
@@ -499,9 +686,33 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	if err := writeExport(repo, run, items, *includeLogs, *output, c); err != nil {
+	useLogs := *includeLogs || (*autoLogs && (run.Conclusion == "failure" || run.Conclusion == "cancelled" || run.Conclusion == "timed_out" || run.Conclusion == "action_required"))
+	if err := writeExport(repo, run, items, useLogs, *output, c); err != nil {
 		fmt.Fprintln(os.Stderr, "Export failed:", err)
 		os.Exit(1)
 	}
 	fmt.Printf("Export written to %s\n", *output)
+}
+
+func showDetails(c *client, repo repoRef, run workflowRun) {
+	jobs, err := c.runJobs(repo, run.ID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Could not load run details:", err)
+		return
+	}
+	fmt.Printf("\nRun #%d details\nCommit message: %s\nBranch: %s\nActor: %s\nURL: %s\n", run.RunNumber, strings.TrimSpace(run.HeadCommit.Message), run.Branch, run.Actor.Login, run.HTMLURL)
+	for _, item := range jobs {
+		status := item.Conclusion
+		if status == "" {
+			status = item.Status
+		}
+		fmt.Printf("\nJob: %s [%s]\n", item.Name, status)
+		for _, step := range item.Steps {
+			stepStatus := step.Conclusion
+			if stepStatus == "" {
+				stepStatus = step.Status
+			}
+			fmt.Printf("  - %s: %s\n", step.Name, stepStatus)
+		}
+	}
 }
