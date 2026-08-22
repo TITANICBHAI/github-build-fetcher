@@ -14,6 +14,19 @@ Then open <http://127.0.0.1:8000> in your browser.
 On Windows, you can double-click `run_github_actions_fetcher.bat` instead.
 On macOS/Linux, run `./run_github_actions_fetcher.sh`.
 
+When the standalone executable starts, it opens the local page in your default
+browser automatically. The page shows the address and provides copy/open
+buttons. Set `AUTO_OPEN_BROWSER=0` to disable automatic opening, such as when
+running it on a remote machine or in automation.
+
+## Independent third-party status
+
+This is an independent community utility and is **not affiliated with,
+endorsed, sponsored, or maintained by GitHub**. GitHub and related names are
+trademarks of GitHub, Inc. The app uses GitHub's public APIs and does not
+represent itself as official GitHub software. The same notice appears in the
+app and can be dismissed for that browser.
+
 ## Windows standalone executable
 
 The **Python apps - Windows** GitHub Actions workflow builds two packages:

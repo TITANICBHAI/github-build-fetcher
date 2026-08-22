@@ -17,6 +17,7 @@ import threading
 import tempfile
 import time
 import uuid
+import webbrowser
 import zipfile
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -33,6 +34,10 @@ SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_bytes(32).hex
 EXPORT_DIR = os.environ.get("EXPORT_DIR", os.path.join("data", "exports"))
 OAUTH_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
+AUTO_OPEN_BROWSER = (
+    not os.environ.get("REPLIT_SESSION")
+    and os.environ.get("AUTO_OPEN_BROWSER", "1").strip().lower() not in ("0", "false", "no", "off")
+)
 sessions = {}
 oauth_states = {}
 jobs = {}
@@ -513,8 +518,10 @@ PAGE = r"""<!doctype html>
 <title>Actions Fetcher</title><style>
 :root{font-family:Inter,system-ui,sans-serif;color:#e8edf7;background:#0b1020}*{box-sizing:border-box}
 body{margin:0;min-height:100vh;background:radial-gradient(circle at 80% 0,#243b68,#10182c 38%,#0b1020 72%)}
-.wrap{max-width:1040px;margin:auto;padding:44px 22px}.eyebrow{color:#73d7c9;font-size:12px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
+ .wrap{max-width:1040px;margin:auto;padding:44px 22px}.eyebrow{color:#73d7c9;font-size:12px;font-weight:800;letter-spacing:.15em;text-transform:uppercase}
 h1{font-size:clamp(38px,6vw,64px);line-height:.98;letter-spacing:-.06em;margin:13px 0 15px}.lead{color:#aebbd2;font-size:17px;line-height:1.5;max-width:650px;margin-bottom:27px}
+ .notice{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;background:#2b2540;border:1px solid #65548b;border-radius:12px;padding:14px 16px;margin-bottom:18px;color:#e5ddf7;font-size:13px;line-height:1.45}.notice strong{color:#fff}.notice button{padding:7px 10px;flex:0 0 auto}.notice[hidden]{display:none}
+ .launchbar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#102d39;border:1px solid #2f7068;border-radius:12px;padding:12px 14px;margin-bottom:18px;color:#c9f1ea;font-size:13px}.launchbar code{font-family:ui-monospace,SFMono-Regular,monospace;background:#081d26;color:#fff;padding:5px 8px;border-radius:6px}.launchbar button{padding:8px 11px}
 .authbar{display:flex;align-items:center;justify-content:space-between;gap:12px;background:#13243d;border:1px solid #304263;border-radius:12px;padding:12px 14px;margin-bottom:18px;color:#c9d4e8;font-size:13px}.authbar button{flex:0 0 auto;padding:8px 11px}
 .panel,.card{background:rgba(19,29,52,.85);border:1px solid #304263;border-radius:19px;padding:22px;box-shadow:0 18px 65px #05081366}
 .grid{display:grid;grid-template-columns:1.05fr .95fr;gap:18px}.field{margin-bottom:17px}label,.legend{display:block;color:#c9d4e8;font-size:12px;font-weight:800;margin-bottom:8px}
@@ -526,8 +533,10 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
 .builds{margin-top:18px}.build{display:flex;justify-content:space-between;gap:12px;align-items:center;border-top:1px solid #2b3c5b;padding:12px 0;cursor:pointer}.build:hover{background:#ffffff08}.build strong{font-size:13px}.build small{display:block;color:#8493ae;margin-top:4px;font-size:11px}.pill{border-radius:99px;padding:5px 8px;font-size:10px;font-weight:800;background:#233b5c;color:#b9cdf1}.success{background:#17433e;color:#a6eee1}.failure{background:#52243a;color:#ffb6c8}
 .summary{display:none;margin-top:18px}.summary.show{display:block}.summary h2{font-size:18px;margin:0 0 14px}.facts{display:grid;grid-template-columns:1fr 1fr;gap:11px}.fact{background:#0d1629;padding:11px;border-radius:10px}.fact span{display:block;color:#8493ae;font-size:10px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px}.fact b{font-size:13px;word-break:break-word}.status{display:none;border-radius:10px;padding:12px;margin-top:15px;font-size:13px;line-height:1.4}.status.show{display:block}.status.error{background:#3b1c2c;color:#ffb6c8;border:1px solid #79354e}.status.ok{background:#173534;color:#a6eee1;border:1px solid #2f7068}.muted{color:#8493ae;font-size:12px}footer{color:#71819d;font-size:11px;margin-top:18px}
 @media(max-width:740px){.grid{grid-template-columns:1fr}.wrap{padding-top:30px}.facts{grid-template-columns:1fr}}
-</style></head><body><main class="wrap"><div class="eyebrow">GitHub Actions utility</div><h1>Bring a build home.</h1>
-<p class="lead">Inspect workflows, choose a build, test access, and fetch exactly what you need — without Git, GitHub CLI, or extra Python packages.</p>
+ </style></head><body><main class="wrap"><div class="eyebrow">Independent GitHub community utility</div><h1>Bring a build home.</h1>
+ <p class="lead">Inspect workflows, choose a build, test access, and fetch exactly what you need — without Git, GitHub CLI, or extra Python packages.</p>
+ <div id="notice" class="notice" role="note"><div><strong>Third-party software notice:</strong> This independent tool is not affiliated with, endorsed, sponsored, or maintained by GitHub. “GitHub” and related names are trademarks of GitHub, Inc. Use your own GitHub account and credentials only through the GitHub service.</div><button id="dismissNotice" class="secondary" type="button" aria-label="Dismiss third-party software notice">Dismiss</button></div>
+ <div class="launchbar"><span>Running locally at</span><code id="address">http://127.0.0.1:8000</code><button id="copyAddress" class="secondary" type="button">Copy address</button><button id="openAddress" class="secondary" type="button">Open in browser</button></div>
  <div class="authbar"><span id="authText">Public repositories work without login. OAuth is optional for private repositories.</span><span class="actions"><button id="login" class="secondary">Log in with GitHub</button><button id="logout" class="secondary" style="display:none">Log out</button><button id="revoke" class="secondary" style="display:none">Revoke GitHub access</button></span></div>
  <section class="card" style="margin-bottom:18px"><div class="legend">Access & API status</div><div class="actions"><button id="diagnostics" class="secondary">Check access and rate limit</button><button id="saveProfile" class="secondary">Save repository profile</button><button id="backupSettings" class="secondary">Backup settings</button><label class="secondary" style="padding:12px 15px;border-radius:10px;cursor:pointer">Restore settings<input id="restoreSettings" type="file" accept=".json" style="display:none"></label></div><div id="diagnosticsView" class="facts" style="margin-top:14px"></div></section>
 <section class="panel"><div class="field"><label for="repo">Repository link</label><input id="repo" placeholder="https://github.com/owner/repository" autocomplete="url"></div>
@@ -546,7 +555,12 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
  <section class="card" style="margin-top:18px"><div class="legend">Compare commits</div><div class="muted">Load a repository, then select 2–6 commits to compare together.</div><div id="commitHistory" class="builds"></div><div class="actions"><button id="compare" class="secondary">Compare selected commits</button></div><div id="comparison" class="builds"></div></section>
 <footer>Exports include run.json, checksums.json, README.txt, artifacts, and optional logs. Temporary files are cleaned up automatically after each request.</footer></main>
 <script>
- const $=id=>document.querySelector('#'+id), state={runs:[],artifacts:[],refreshTimer:null,progressTimer:null};
+  const $=id=>document.querySelector('#'+id), state={runs:[],artifacts:[],refreshTimer:null,progressTimer:null};
+ const address=location.origin;$('address').textContent=address;
+ if(localStorage.getItem('actions-fetcher-notice-dismissed')==='1')$('notice').hidden=true;
+ $('dismissNotice').onclick=()=>{localStorage.setItem('actions-fetcher-notice-dismissed','1');$('notice').hidden=true};
+ $('openAddress').onclick=()=>window.open(address,'_blank','noopener');
+ $('copyAddress').onclick=async()=>{try{await navigator.clipboard.writeText(address);$('copyAddress').textContent='Copied';setTimeout(()=>$('copyAddress').textContent='Copy address',1400)}catch(e){message('Copy failed — select the address manually.','error')}};
 function token(){return $('pat').value} function message(text,kind='ok'){const x=$('status');x.className='status show '+kind;x.textContent=text}
 async function authState(){try{const x=await fetch('/auth/me').then(r=>r.json());if(x.authenticated){$('authText').textContent='Signed in as '+(x.user.login||'GitHub user')+'. Session expires after inactivity.';$('login').style.display='none';$('logout').style.display='inline-block';$('revoke').style.display='inline-block';$('pat').placeholder='OAuth session active — optional PAT fallback'}else if(!$('login').textContent.includes('not configured')){$('authText').textContent='Public repositories work without login. OAuth is optional for private repositories.'}}catch(e){}}
 $('login').onclick=()=>{location.href='/oauth/login'};$('logout').onclick=()=>{location.href='/oauth/logout'};$('revoke').onclick=async()=>{if(!confirm('Revoke this app’s GitHub access?'))return;try{await post('/oauth/revoke',{});location.reload()}catch(e){message(e.message,'error')}};
@@ -914,5 +928,10 @@ def send_download(handler, token):
 
 
 if __name__ == "__main__":
-    print(f"GitHub Actions Fetcher running at http://{HOST}:{PORT}")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    browser_host = "127.0.0.1" if HOST in ("0.0.0.0", "::") else HOST
+    browser_url = f"http://{browser_host}:{PORT}"
+    print(f"GitHub Actions Fetcher running at {browser_url}")
+    server = ThreadingHTTPServer((HOST, PORT), Handler)
+    if AUTO_OPEN_BROWSER:
+        threading.Timer(0.8, lambda: webbrowser.open(browser_url)).start()
+    server.serve_forever()
