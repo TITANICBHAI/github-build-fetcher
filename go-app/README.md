@@ -72,7 +72,47 @@ Watch mode ignores Git metadata, caches, local exports, and downloads. Every
 changed file still passes the secret and 10 MB safety checks. Use
 `--dry-run` first to preview changes without contacting GitHub.
 
-This dependency-free Go milestone covers Actions inspection, artifact/log
-export, progress reporting, safe file upload, local safety scanning, and
-folder watch mode. A later milestone can add a richer native desktop window
-and settings storage using the operating system credential manager.
+## Local parity features
+
+The executable also includes local controls that do not require GitHub CLI,
+Python, Git, Node.js, or third-party packages:
+
+```bash
+# Upload the complete project after the same safety scan used by uploads.
+./github-fetcher --repo https://github.com/owner/repository \
+  --push-project --project-dir . --project-path project --branch main
+
+# Preview the full-project operation without network writes.
+./github-fetcher --repo https://github.com/owner/repository \
+  --push-project --dry-run
+
+# Start a local control window and expose job status/cancellation endpoints.
+./github-fetcher --repo https://github.com/owner/repository \
+  --push-project --window 127.0.0.1:8765
+```
+
+The control window is a portable local web window opened with the operating
+system launcher (`xdg-open`, `open`, or Windows URL handling); it is not a
+browser extension and does not require a hosted service. Background jobs expose
+`GET /jobs`, `GET /jobs/<id>`, and `POST /jobs/<id>/cancel`.
+
+Settings backups contain only non-secret values:
+
+```bash
+./github-fetcher --backup-settings fetcher-settings.json
+./github-fetcher --restore-settings fetcher-settings.json
+```
+
+Credential storage uses the native OS manager when available: Linux Secret
+Service (`secret-tool`), macOS Keychain (`security`), or Windows Credential
+Manager. It never falls back to a plaintext file. Device login uses the
+GitHub OAuth device endpoint directly (set `GITHUB_OAUTH_CLIENT_ID`); GitHub
+CLI is not required. Use `--store-credential` after login if desired.
+Subsequent Linux/macOS runs can read that credential back from the same manager;
+the Windows build deliberately requires an environment variable for retrieval
+unless a native credential client is supplied.
+
+Run filtering additionally supports `--actor-filter` and `--commit-filter`,
+while existing branch, status, event, workflow-name, and date filters remain
+available. API failures include operation context and should be treated as
+actionable errors rather than silently retried.

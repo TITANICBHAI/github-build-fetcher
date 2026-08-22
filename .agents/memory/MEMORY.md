@@ -1,2 +1,3 @@
 - [GitHub Actions run identifiers](github-actions-run-identifiers.md) — copied Actions URLs contain run IDs, distinct from the UI run number.
 - [Go migration](go-migration.md) — Python remains the reference; Go targets a dependency-free standalone executable and must preserve the no-secret-in-source boundary.
+- [Go local parity](go-local-parity.md) — local jobs, settings, project sync, device flow, and OS credential storage stay dependency-free and never persist secrets in backups.

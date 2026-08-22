@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -57,6 +59,10 @@ type workflowRun struct {
 	Actor struct {
 		Login string `json:"login"`
 	} `json:"actor"`
+	HeadSHA      string `json:"head_sha"`
+	UpdatedAt    string `json:"updated_at"`
+	WorkflowID   int64  `json:"workflow_id"`
+	WorkflowPath string `json:"path"`
 }
 type workflow struct {
 	ID    int64  `json:"id"`
@@ -86,6 +92,18 @@ type contentFile struct {
 	Content  string `json:"content"`
 	SHA      string `json:"sha"`
 	Encoding string `json:"encoding"`
+}
+
+type apiError struct {
+	Status int
+	Body   string
+}
+
+func (e *apiError) Error() string {
+	if e.Body == "" {
+		return fmt.Sprintf("GitHub returned HTTP %d", e.Status)
+	}
+	return fmt.Sprintf("GitHub returned HTTP %d: %s", e.Status, e.Body)
 }
 
 func parseRepo(raw string) (repoRef, error) {
@@ -125,7 +143,8 @@ func (c *client) json(endpoint string, target any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("GitHub returned HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return &apiError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(target)
 }
@@ -141,7 +160,8 @@ func (c *client) mutate(method, endpoint string, payload any, target any) error 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("GitHub returned HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<10))
+		return &apiError{Status: resp.StatusCode, Body: strings.TrimSpace(string(body))}
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(target)
 }
@@ -172,6 +192,10 @@ func (c *client) runs(repo repoRef, selector string, workflowID int64) ([]workfl
 	if err != nil {
 		return nil, fmt.Errorf("run must be a numeric ID or run number")
 	}
+	var direct workflowRun
+	if n > 1000000000 && c.json(fmt.Sprintf("/repos/%s/%s/actions/runs/%d", repo.owner, repo.name, n), &direct) == nil && direct.ID != 0 {
+		return []workflowRun{direct}, nil
+	}
 	for _, run := range payload.Runs {
 		if run.ID == n || int64(run.RunNumber) == n {
 			return []workflowRun{run}, nil
@@ -180,7 +204,7 @@ func (c *client) runs(repo repoRef, selector string, workflowID int64) ([]workfl
 	return nil, fmt.Errorf("run %s was not found in the latest 20 runs", selector)
 }
 
-func filterRuns(runs []workflowRun, branch, status, event, name, since string) []workflowRun {
+func filterRuns(runs []workflowRun, branch, status, event, name, since, actor, commit string) []workflowRun {
 	var filtered []workflowRun
 	for _, run := range runs {
 		if branch != "" && !strings.Contains(strings.ToLower(run.Branch), strings.ToLower(branch)) {
@@ -197,6 +221,12 @@ func filterRuns(runs []workflowRun, branch, status, event, name, since string) [
 			continue
 		}
 		if name != "" && !strings.Contains(strings.ToLower(run.Name), strings.ToLower(name)) {
+			continue
+		}
+		if actor != "" && !strings.Contains(strings.ToLower(run.Actor.Login), strings.ToLower(actor)) {
+			continue
+		}
+		if commit != "" && !strings.Contains(strings.ToLower(run.HeadSHA), strings.ToLower(commit)) && !strings.Contains(strings.ToLower(run.HeadCommit.Message), strings.ToLower(commit)) {
 			continue
 		}
 		if since != "" && len(run.CreatedAt) >= 10 && run.CreatedAt[:10] < since {
@@ -433,9 +463,12 @@ func uploadFile(c *client, repo repoRef, source, branch, target, message string,
 			return fmt.Errorf("possible credential detected in %s", source)
 		}
 	}
-	existing, err := c.existingFile(repo, branch, target)
-	if err != nil {
-		return err
+	var existing *contentFile
+	if !dryRun {
+		existing, err = c.existingFile(repo, branch, target)
+		if err != nil {
+			return err
+		}
 	}
 	if existing != nil && !overwrite {
 		return fmt.Errorf("target already exists; use --overwrite to replace it")
@@ -524,6 +557,21 @@ func writeExport(repo repoRef, run workflowRun, artifacts []artifact, includeLog
 			return err
 		}
 	}
+	checksums := make(map[string]string)
+	for _, item := range files {
+		digest, err := sha256File(item.path)
+		if err != nil {
+			return err
+		}
+		checksums["artifacts/"+item.name+".zip"] = "sha256:" + digest
+	}
+	if logPath != "" {
+		digest, err := sha256File(logPath)
+		if err != nil {
+			return err
+		}
+		checksums["logs.zip"] = "sha256:" + digest
+	}
 	out, err := os.Create(output)
 	if err != nil {
 		return err
@@ -531,9 +579,11 @@ func writeExport(repo repoRef, run workflowRun, artifacts []artifact, includeLog
 	defer out.Close()
 	archive := zip.NewWriter(out)
 	runJSON, _ := json.MarshalIndent(run, "", "  ")
+	checksumJSON, _ := json.MarshalIndent(checksums, "", "  ")
 	for name, data := range map[string][]byte{
-		"run.json":   runJSON,
-		"README.txt": []byte(fmt.Sprintf("GitHub Actions export\nRepository: %s/%s\nRun: #%d\nStatus: %s\n", repo.owner, repo.name, run.RunNumber, run.Conclusion)),
+		"run.json":       runJSON,
+		"checksums.json": checksumJSON,
+		"README.txt":     []byte(fmt.Sprintf("GitHub Actions export\nRepository: %s/%s\nRun: #%d (ID %d)\nStatus: %s\n\nSHA-256 values are in checksums.json.\n", repo.owner, repo.name, run.RunNumber, run.ID, run.Conclusion)),
 	} {
 		w, err := archive.Create(name)
 		if err != nil {
@@ -554,6 +604,19 @@ func writeExport(repo repoRef, run workflowRun, artifacts []artifact, includeLog
 		}
 	}
 	return archive.Close()
+}
+
+func sha256File(path string) (string, error) {
+	input, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer input.Close()
+	hash := sha256.New()
+	if _, err := io.Copy(hash, input); err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 func addFileToZip(archive *zip.Writer, source, name string) error {
@@ -700,6 +763,8 @@ func main() {
 	statusFilter := flag.String("status-filter", "", "only show runs with this status")
 	eventFilter := flag.String("event-filter", "", "filter by event when present in the GitHub response")
 	nameFilter := flag.String("name-filter", "", "only show runs whose workflow name contains this text")
+	actorFilter := flag.String("actor-filter", "", "only show runs created by an actor containing this text")
+	commitFilter := flag.String("commit-filter", "", "only show runs whose SHA or message contains this text")
 	since := flag.String("since", "", "only show runs created on or after YYYY-MM-DD")
 	diagnostics := flag.Bool("diagnostics", false, "show API rate limit and repository visibility")
 	listBranches := flag.Bool("branches", false, "list repository branches")
@@ -723,6 +788,16 @@ func main() {
 	watchDir := flag.String("watch-dir", ".", "directory to watch with --watch")
 	watchPath := flag.String("watch-path", "uploads", "repository directory prefix for --watch")
 	watchInterval := flag.Int("watch-interval", 60, "seconds between --watch scans")
+	fullPush := flag.Bool("push-project", false, "upload the complete project after a safety scan")
+	projectDir := flag.String("project-dir", ".", "project directory for --push-project")
+	projectPath := flag.String("project-path", "project", "repository prefix for --push-project")
+	control := flag.String("window", "", "open a local control window on HOST:PORT, e.g. 127.0.0.1:8765")
+	device := flag.Bool("device-login", false, "authenticate with GitHub's device flow without GitHub CLI")
+	storeCredentialFlag := flag.Bool("store-credential", false, "store the supplied token in the operating system credential manager")
+	credentialService := flag.String("credential-service", "github-fetcher", "service name for --store-credential")
+	credentialAccount := flag.String("credential-account", "default", "account name for --store-credential")
+	backup := flag.String("backup-settings", "", "write non-secret local settings to a JSON file")
+	restore := flag.String("restore-settings", "", "read non-secret local settings from a JSON file")
 	flag.Parse()
 
 	if *scan {
@@ -732,6 +807,25 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Printf("Safety scan passed: %d files are eligible for upload.\n", len(files))
+		return
+	}
+	settings := map[string]string{"repo": *repoArg, "branch": *branch, "message": *message, "watch_dir": *watchDir, "watch_path": *watchPath, "project_dir": *projectDir, "project_path": *projectPath}
+	if *backup != "" {
+		if err := saveSettings(*backup, settings); err != nil {
+			fmt.Fprintln(os.Stderr, "Settings backup failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Settings backup written to", *backup)
+		return
+	}
+	if *restore != "" {
+		values, err := loadSettings(*restore)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Settings restore failed:", err)
+			os.Exit(1)
+		}
+		encoded, _ := json.MarshalIndent(values, "", "  ")
+		fmt.Println(string(encoded))
 		return
 	}
 	repo, err := parseRepo(*repoArg)
@@ -744,10 +838,58 @@ func main() {
 	if token == "" {
 		token = strings.TrimSpace(os.Getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
 	}
-	if token == "" {
+	if *device {
+		token, err = deviceLogin(os.Getenv("GITHUB_OAUTH_CLIENT_ID"))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Device login failed:", err)
+			os.Exit(1)
+		}
+	}
+	if token == "" && !*dryRun {
+		if stored, loadErr := loadCredential(*credentialService, *credentialAccount); loadErr == nil {
+			token = stored
+			fmt.Println("Using the credential stored in the operating system credential manager.")
+		}
+	}
+	if token == "" && !*dryRun {
 		token = prompt("GitHub token (kept in memory only): ")
 	}
+	if *storeCredentialFlag {
+		if err := storeCredential(*credentialService, *credentialAccount, token); err != nil {
+			fmt.Fprintln(os.Stderr, "Credential storage failed:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Credential stored in the operating system credential manager.")
+		return
+	}
 	c := &client{token: token, http: &http.Client{Timeout: 90 * time.Second}}
+	jobs := newLocalJobs()
+	if *control != "" {
+		go func() {
+			if err := serveControlWindow(jobs, *control); err != nil {
+				fmt.Fprintln(os.Stderr, "Control window stopped:", err)
+			}
+		}()
+		fmt.Println("Local control window available at http://" + *control)
+	}
+	if *fullPush {
+		id := jobs.start("project-push", func(ctx context.Context) (map[string]any, error) {
+			return fullProjectPush(ctx, c, repo, *projectDir, *projectPath, *branch, *message, *dryRun)
+		})
+		fmt.Println("Project push job started:", id)
+		for {
+			job, _ := jobs.snapshot(id)
+			if job.Status == "completed" || job.Status == "failed" || job.Status == "cancelled" {
+				if job.Error != "" {
+					fmt.Fprintln(os.Stderr, job.Error)
+					os.Exit(1)
+				}
+				fmt.Printf("Project push completed: %v\n", job.Result["files"])
+				return
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
 	if *upload != "" {
 		if *uploadPath == "" {
 			*uploadPath = filepath.Base(*upload)
@@ -834,7 +976,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	runs = filterRuns(runs, *branchFilter, *statusFilter, *eventFilter, *nameFilter, *since)
+	runs = filterRuns(runs, *branchFilter, *statusFilter, *eventFilter, *nameFilter, *since, *actorFilter, *commitFilter)
 	if *inspect {
 		fmt.Printf("\n%s/%s — recent Actions runs\n\n", repo.owner, repo.name)
 		for _, run := range runs {
