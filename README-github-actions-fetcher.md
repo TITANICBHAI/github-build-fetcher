@@ -86,7 +86,7 @@ That folder is ignored by Git.
 ## Push the project to GitHub
 
 `push_current_code.py` safely pushes the current folder to the configured
-`github-build-fetcher` repository. It uses only Git and Python's standard
+`BuildFetchr` repository. It uses only Git and Python's standard
 library. The token is read from `GITHUB_PERSONAL_ACCESS_TOKEN` at runtime and
 is sent as a temporary HTTP header; it is not saved in the remote URL or files.
 

@@ -21,7 +21,7 @@ import time
 from urllib.parse import urlparse
 
 
-DEFAULT_REPOSITORY = "https://github.com/TITANICBHAI/github-build-fetcher"
+DEFAULT_REPOSITORY = "https://github.com/TITANICBHAI/BuildFetchr"
 DEFAULT_BRANCH = "main"
 DEFAULT_AUTHOR_NAME = "GitHub Fetcher Bot"
 DEFAULT_AUTHOR_EMAIL = "github-fetcher-bot@users.noreply.github.com"
