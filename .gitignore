@@ -47,3 +47,6 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# GitHub Actions Fetcher generated downloads
+/data/exports/

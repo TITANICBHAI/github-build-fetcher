@@ -8,7 +8,8 @@ A standalone browser app for downloading a GitHub Actions build and its artifact
 python github_actions_fetcher.py
 ```
 
-Open <http://127.0.0.1:8765>.
+Open the Replit preview after starting the workflow. For local use, open
+<http://127.0.0.1:8000>.
 
 You can enter the PAT in the form each time, or keep it out of the form by setting
 the `GITHUB_PERSONAL_ACCESS_TOKEN` environment variable before starting the app:
@@ -42,3 +43,10 @@ the token directly into this Python file or commit it to Git.
 - Keeps the PAT in request memory only; it is not written to disk, logged, or placed in the downloaded ZIP.
 
 The token needs permission to read the repository's Actions runs and artifacts. For private repositories, use a fine-grained token with access to that repository and read-only Actions/Contents permissions as appropriate.
+
+## Replit workflow
+
+The Replit workflow runs `python3 github_actions_fetcher.py` on port 8000 and
+binds to all interfaces so the preview and published app can reach it. Generated
+downloads are stored in `data/exports` for up to 24 hours, so a workflow restart
+does not invalidate a download immediately. That folder is ignored by Git.

@@ -2,7 +2,7 @@
 """Dependency-free GitHub Actions artifact fetcher.
 
 Run: python github_actions_fetcher.py
-Open: http://127.0.0.1:8765
+Open: the Replit preview URL (or http://127.0.0.1:8000 locally)
 """
 
 import base64
@@ -22,12 +22,13 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("PORT", "8765"))
+HOST = os.environ.get("HOST", "0.0.0.0")
+PORT = int(os.environ.get("PORT", "8000"))
 GITHUB_API = "https://api.github.com"
 MAX_JSON = 4_000_000
 SESSION_TTL = 30 * 60
 SESSION_SECRET = os.environ.get("SESSION_SECRET") or secrets.token_bytes(32).hex()
+EXPORT_DIR = os.environ.get("EXPORT_DIR", os.path.join("data", "exports"))
 OAUTH_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID", "")
 OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET", "")
 sessions = {}
@@ -347,7 +348,7 @@ async function loadHistory(){try{const x=await post('/history',{repo:$('repo').v
 async function loadArtifacts(id){try{const x=await post('/artifacts',{repo:$('repo').value,pat:token(),run_id:id});state.artifacts=x.artifacts;$('artifactHint').textContent=x.artifacts.length? 'Download an individual artifact without bundling the whole build.':'No artifacts were attached to this build.';$('artifacts').innerHTML=x.artifacts.map(a=>'<div class="build"><div><strong>'+esc(a.name)+'</strong><small>'+Math.round((a.size_in_bytes||0)/1024)+' KB · '+esc(a.digest||'no digest')+'</small></div><button class="secondary" data-id="'+a.id+'">Download</button></div>').join('');document.querySelectorAll('#artifacts button').forEach(b=>b.onclick=e=>downloadArtifact(e,b.dataset.id))}
 catch(e){$('artifactHint').textContent=e.message}}
 async function downloadArtifact(e,id){e.stopPropagation();const b=e.currentTarget;b.disabled=true;b.textContent='Downloading…';try{const r=await post('/artifact',{repo:$('repo').value,pat:token(),run_id:$('selector').value||$('build').value,artifact_id:id});saveResponse(r,'artifact');message('Individual artifact downloaded.','ok')}catch(x){message(x.message,'error')}finally{b.disabled=false;b.textContent='Download'}}
-function saveResponse(r,kind){if(r.saved_path)message(kind+' saved to '+r.saved_path+'. Browser download is also ready.','ok');const bytes=Uint8Array.from(atob(r.data),c=>c.charCodeAt(0));const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([bytes],{type:'application/zip'}));a.download=r.filename;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
+ function saveResponse(r,kind){if(r.saved_path)message(kind+' saved to '+r.saved_path+'. Browser download is also ready.','ok');const a=document.createElement('a');a.href=r.download_url;a.download=r.filename;a.rel='noopener';document.body.appendChild(a);a.click();a.remove()}
 $('test').onclick=async()=>{try{$('test').disabled=true;message('Testing GitHub access…');await inspect(true)}catch(e){message(e.message,'error')}finally{$('test').disabled=false}};
 $('inspect').onclick=async()=>{try{$('inspect').disabled=true;message('Loading workflows and builds…');await inspect()}catch(e){message(e.message,'error')}finally{$('inspect').disabled=false}};
 $('inspect').addEventListener('click',loadHistory);
@@ -433,7 +434,7 @@ class Handler(BaseHTTPRequestHandler):
             session = session_for(self)
             self.respond(HTTPStatus.OK, {"authenticated": bool(session), "user": session["user"] if session else None, "expires_in": max(0, int(SESSION_TTL - (time.time() - session["last_seen"]))) if session else 0})
         elif self.path.startswith("/download/"):
-            self.send_error(HTTPStatus.NOT_FOUND)
+            send_download(self, self.path.removeprefix("/download/").split("/", 1)[0])
         else:
             self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -512,15 +513,18 @@ class Handler(BaseHTTPRequestHandler):
                     name = safe_name(artifact.get("name"), "artifact") + ".zip"
                     path = os.path.join(folder, name)
                     digest = download_resumable(artifact["archive_download_url"], token, path, artifact.get("digest"))
-                    data = open(path, "rb").read()
+                    with open(path, "rb") as source:
+                        data = source.read()
                 saved = save_file(payload.get("save_to"), name, data)
-                self.respond(HTTPStatus.OK, {"filename": name, "saved_path": saved, "digest": digest, "data": base64.b64encode(data).decode("ascii")})
+                token = persist_download(name, data)
+                self.respond(HTTPStatus.OK, {"filename": name, "saved_path": saved, "digest": digest, "download_url": f"/download/{token}"})
                 return
             if self.path == "/fetch":
                 archive, run, artifacts, logs = build_export(owner, repo, token, payload.get("selector"), workflow_id, bool(payload.get("logs")), bool(payload.get("auto")))
                 filename = f"github-actions-{safe_name(owner, 'owner')}-{safe_name(repo, 'repo')}-run-{run.get('run_number', run.get('id'))}.zip"
                 saved = save_file(payload.get("save_to"), filename, archive)
-                self.respond(HTTPStatus.OK, {"filename": filename, "saved_path": saved, "artifacts": len(artifacts), "logs": logs, "data": base64.b64encode(archive).decode("ascii")})
+                token = persist_download(filename, archive)
+                self.respond(HTTPStatus.OK, {"filename": filename, "saved_path": saved, "artifacts": len(artifacts), "logs": logs, "download_url": f"/download/{token}"})
                 return
             self.send_error(HTTPStatus.NOT_FOUND)
         except (ValueError, HTTPError, URLError, RuntimeError, json.JSONDecodeError) as error:
@@ -540,6 +544,58 @@ def save_file(folder, filename, data):
     with open(path, "wb") as output:
         output.write(data)
     return path
+
+
+def persist_download(filename, data):
+    """Store a browser download outside the request lifetime.
+
+    Returning ZIP bytes inside JSON made larger downloads fail in browsers and
+    through Replit's proxy. A short-lived, server-side file gives the browser
+    a normal streaming download instead.
+    """
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    now = time.time()
+    for entry in os.scandir(EXPORT_DIR):
+        if entry.is_file() and now - entry.stat().st_mtime > 24 * 60 * 60:
+            try:
+                os.remove(entry.path)
+            except OSError:
+                pass
+    token = secrets.token_urlsafe(24)
+    path = os.path.join(EXPORT_DIR, token + ".zip")
+    metadata = os.path.join(EXPORT_DIR, token + ".json")
+    with open(path, "wb") as output:
+        output.write(data)
+    with open(metadata, "w", encoding="utf-8") as output:
+        json.dump({"filename": os.path.basename(filename)}, output)
+    return token
+
+
+def send_download(handler, token):
+    if not re.match(r"^[A-Za-z0-9_-]{20,80}$", token):
+        handler.send_error(HTTPStatus.NOT_FOUND)
+        return
+    path = os.path.join(EXPORT_DIR, token + ".zip")
+    metadata_path = os.path.join(EXPORT_DIR, token + ".json")
+    if not os.path.isfile(path) or not os.path.isfile(metadata_path):
+        handler.send_error(HTTPStatus.NOT_FOUND, "This download has expired.")
+        return
+    try:
+        with open(metadata_path, encoding="utf-8") as metadata_file:
+            filename = safe_name(json.load(metadata_file).get("filename"), "download.zip")
+    except (OSError, ValueError, json.JSONDecodeError):
+        handler.send_error(HTTPStatus.NOT_FOUND)
+        return
+    size = os.path.getsize(path)
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", "application/zip")
+    handler.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+    handler.send_header("Content-Length", str(size))
+    handler.send_header("Cache-Control", "no-store")
+    handler.end_headers()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            handler.wfile.write(chunk)
 
 
 if __name__ == "__main__":
