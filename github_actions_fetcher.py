@@ -286,16 +286,78 @@ def run_summary(run):
 
 def nice_error(error):
     if isinstance(error, HTTPError):
+        remaining = error.headers.get("X-RateLimit-Remaining", "")
+        if error.code == 403 and remaining == "0":
+            reset = error.headers.get("X-RateLimit-Reset", "")
+            reset_hint = ""
+            if reset.isdigit():
+                reset_hint = f" Try again after {time.strftime('%H:%M UTC', time.gmtime(int(reset)))}."
+            return "GitHub rate limit reached." + reset_hint
         if error.code == 401:
-            return "GitHub rejected the PAT. Check that it is valid and has repository access."
+            return "GitHub rejected the credential. It may be expired, revoked, or missing access to this repository."
         if error.code == 403:
-            return "GitHub denied access. The PAT may need Actions read access, or GitHub rate limits may apply."
+            return "GitHub denied this operation. Check that the PAT has repository Contents write access for uploads and Actions read access for downloads."
         if error.code == 404:
-            return "Repository, workflow, or build not found, or the PAT cannot see it."
+            return "GitHub could not find this repository, workflow, build, or artifact. For a private repository, confirm the PAT can access that repository."
+        if error.code == 409:
+            return "GitHub reported a conflict. The branch may have changed; refresh the repository and try again."
+        if error.code == 422:
+            return "GitHub rejected the request. Check the branch, file path, commit message, and whether overwriting an existing file was explicitly enabled."
         return f"GitHub returned HTTP {error.code}."
     if isinstance(error, URLError):
         return "Could not reach GitHub. Check your internet connection."
     return str(error)
+
+
+def github_write(url, token, payload):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "portable-github-actions-fetcher",
+        "Content-Type": "application/json",
+    }
+    if token:
+        headers["Authorization"] = "Bearer " + token
+    request = Request(url, data=json.dumps(payload).encode("utf-8"), headers=headers, method="PUT")
+    with urlopen(request, timeout=90) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def push_file(owner, repo, token, branch, path, message, content, overwrite):
+    branch = str(branch or "").strip()
+    path = str(path or "").strip().replace("\\", "/").lstrip("/")
+    message = str(message or "").strip()
+    if not branch:
+        raise ValueError("Enter the target branch.")
+    if not message:
+        raise ValueError("Enter a commit message.")
+    if not path or path.endswith("/") or ".." in path.split("/"):
+        raise ValueError("Enter a safe repository file path, such as exports/build.zip.")
+    if len(path) > 400:
+        raise ValueError("The repository file path is too long.")
+    if not content or len(content) > 13_000_000:
+        raise ValueError("The selected file is empty or larger than the 9 MB upload limit.")
+    contents_url = repo_root(owner, repo) + "/contents/" + quote(path, safe="/")
+    existing_sha = None
+    try:
+        existing = api_json(contents_url + "?ref=" + quote(branch), token)
+        existing_sha = existing.get("sha")
+    except HTTPError as error:
+        if error.code != 404:
+            raise
+    if existing_sha and not overwrite:
+        raise ValueError("That file already exists. Enable “Allow overwrite” to replace it.")
+    payload = {"message": message, "content": content, "branch": branch}
+    if existing_sha:
+        payload["sha"] = existing_sha
+    result = github_write(contents_url, token, payload)
+    return {
+        "commit": result.get("commit", {}).get("sha"),
+        "url": result.get("content", {}).get("html_url"),
+        "path": path,
+        "branch": branch,
+        "overwrote": bool(existing_sha),
+    }
 
 
 PAGE = r"""<!doctype html>
@@ -324,22 +386,24 @@ button:hover{background:#9ce9df}button:disabled{opacity:.55;cursor:wait}.seconda
 <div class="actions"><button id="test" class="secondary">Test token & access</button><button id="inspect">Load workflows & builds</button></div><div id="status" class="status"></div></section>
 <div class="grid" style="margin-top:18px"><section class="card"><div class="field"><label for="workflow">Workflow</label><select id="workflow" disabled><option value="">All workflows</option></select></div>
 <div class="field"><label for="build">Selected build</label><select id="build" disabled><option value="">Latest build</option></select><div class="hint">You can also paste a run ID or run number below.</div></div>
+ <div class="field"><label>Filter visible builds</label><div class="grid"><input id="branchFilter" placeholder="Branch"><input id="nameFilter" placeholder="Workflow name"></div><div class="grid" style="margin-top:8px"><select id="statusFilter"><option value="">Any status</option><option value="success">Success</option><option value="failure">Failure</option><option value="cancelled">Cancelled</option><option value="in_progress">In progress</option></select><select id="eventFilter"><option value="">Any event</option><option value="push">Push</option><option value="pull_request">Pull request</option><option value="workflow_dispatch">Manual</option></select></div><input id="dateFilter" type="date" style="margin-top:8px"><div class="actions" style="margin-top:8px"><button id="refresh" class="secondary">Refresh builds</button><label class="check"><input id="autoRefresh" type="checkbox"> <span>Refresh every 30 seconds</span></label></div></div>
 <div class="field"><label for="selector">Specific run ID / number (optional)</label><input id="selector" inputmode="numeric" placeholder="e.g. 32551351734"></div>
 <div class="check"><input id="logs" type="checkbox"> <span>Include logs</span></div><div class="check"><input id="auto" type="checkbox" checked> <span>Auto-fetch logs if build failed</span></div>
 <div class="field"><label for="save">Save ZIP to folder (optional)</label><input id="save" placeholder="C:\Users\You\Downloads or /home/you/Downloads"><div class="hint">When filled, the server saves a copy there and still offers a browser download.</div></div>
 <div class="actions"><button id="download">Fetch selected build</button></div></section>
 <section class="card"><div class="legend">Build summary</div><div id="empty" class="muted">Load the repository to see the latest 20 builds.</div><div id="summary" class="summary"><h2 id="summaryTitle"></h2><div id="facts" class="facts"></div></div><div class="builds" id="builds"></div></section></div>
-<section class="card" style="margin-top:18px"><div class="legend">Individual artifacts</div><div id="artifactHint" class="muted">Select a build to see its artifacts.</div><div id="artifacts"></div></section>
-<section class="card" style="margin-top:18px"><div class="legend">Compare commits</div><div class="muted">Load a repository, then select 2–6 commits to compare together.</div><div id="commitHistory" class="builds"></div><div class="actions"><button id="compare" class="secondary">Compare selected commits</button></div><div id="comparison" class="builds"></div></section>
+ <section class="card" style="margin-top:18px"><div class="legend">Individual artifacts</div><div id="artifactHint" class="muted">Select a build to see its artifacts.</div><div id="artifacts"></div></section>
+ <section class="card" style="margin-top:18px"><div class="legend">Push a file to GitHub</div><div class="muted">This creates one explicit commit. A PAT with Contents write access is required.</div><div class="grid" style="margin-top:14px"><div><div class="field"><label for="pushFile">File to upload</label><input id="pushFile" type="file"></div><div class="field"><label for="pushBranch">Target branch</label><input id="pushBranch" value="main" placeholder="main"></div><div class="field"><label for="pushPath">Repository path</label><input id="pushPath" placeholder="exports/build.zip"></div></div><div><div class="field"><label for="pushMessage">Commit message</label><input id="pushMessage" placeholder="Upload build export"></div><div class="check"><input id="overwrite" type="checkbox"> <span>Allow overwrite of an existing file</span></div><div class="actions"><button id="push" class="secondary">Create GitHub commit</button></div></div></div><div id="pushStatus" class="muted" style="margin-top:12px"></div></section>
+ <section class="card" style="margin-top:18px"><div class="legend">Compare commits</div><div class="muted">Load a repository, then select 2–6 commits to compare together.</div><div id="commitHistory" class="builds"></div><div class="actions"><button id="compare" class="secondary">Compare selected commits</button></div><div id="comparison" class="builds"></div></section>
 <footer>Exports include run.json, checksums.json, README.txt, artifacts, and optional logs. Temporary files are cleaned up automatically after each request.</footer></main>
 <script>
-const $=id=>document.querySelector('#'+id), state={runs:[],artifacts:[]};
+ const $=id=>document.querySelector('#'+id), state={runs:[],artifacts:[],refreshTimer:null,progressTimer:null};
 function token(){return $('pat').value} function message(text,kind='ok'){const x=$('status');x.className='status show '+kind;x.textContent=text}
 async function authState(){try{const x=await fetch('/auth/me').then(r=>r.json());if(x.authenticated){$('authText').textContent='Signed in as '+(x.user.login||'GitHub user')+'. Session expires after inactivity.';$('login').style.display='none';$('logout').style.display='inline-block';$('revoke').style.display='inline-block';$('pat').placeholder='OAuth session active — optional PAT fallback'}else if(!$('login').textContent.includes('not configured')){$('authText').textContent='Public repositories work without login. OAuth is optional for private repositories.'}}catch(e){}}
 $('login').onclick=()=>{location.href='/oauth/login'};$('logout').onclick=()=>{location.href='/oauth/logout'};$('revoke').onclick=async()=>{if(!confirm('Revoke this app’s GitHub access?'))return;try{await post('/oauth/revoke',{});location.reload()}catch(e){message(e.message,'error')}};
 function summary(run){$('empty').style.display='none';$('summary').className='summary show';$('summaryTitle').textContent=(run.name||'Workflow')+' · build #'+(run.run_number||'—');const vals=[['Status',run.conclusion||run.status||'—'],['Branch',run.branch||'—'],['Commit',run.commit||'—'],['Author',run.author||'—'],['Event',run.event||'—'],['Message',run.message||'—']];$('facts').innerHTML=vals.map(x=>'<div class="fact"><span>'+x[0]+'</span><b>'+esc(x[1])+'</b></div>').join('')}
 function esc(x){return String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-function renderRuns(){const runs=state.runs;$('build').disabled=!runs.length;$('build').innerHTML='<option value="">Latest build</option>'+runs.map(r=>'<option value="'+r.id+'">#'+r.run_number+' · '+esc(r.name||'workflow')+' · '+esc(r.conclusion||r.status)+'</option>').join('');$('builds').innerHTML=runs.map((r,i)=>'<div class="build" data-i="'+i+'"><div><strong>#'+r.run_number+' · '+esc(r.name||'Workflow')+'</strong><small>'+esc(r.branch||'no branch')+' · '+esc((r.commit||'').slice(0,12))+' · '+esc(r.author||'unknown')+'</small></div><span class="pill '+(r.conclusion==='success'?'success':r.conclusion?'failure':'')+'">'+esc(r.conclusion||r.status||'unknown')+'</span></div>').join('');document.querySelectorAll('.build').forEach(x=>x.onclick=()=>selectRun(runs[x.dataset.i]))}
+ function renderRuns(){const branch=($('branchFilter')?.value||'').toLowerCase(),status=($('statusFilter')?.value||'').toLowerCase(),event=($('eventFilter')?.value||'').toLowerCase(),name=($('nameFilter')?.value||'').toLowerCase(),since=$('dateFilter')?.value||'';const runs=state.runs.filter(r=>(!branch||(r.branch||'').toLowerCase().includes(branch))&&(!status||String(r.conclusion||r.status||'').toLowerCase()===status)&&(!event||String(r.event||'').toLowerCase()===event)&&(!name||(r.name||'').toLowerCase().includes(name))&&(!since||String(r.created_at||'').slice(0,10)>=since));$('build').disabled=!runs.length;$('build').innerHTML='<option value="">Latest visible build</option>'+runs.map(r=>'<option value="'+r.id+'">#'+r.run_number+' · '+esc(r.name||'workflow')+' · '+esc(r.conclusion||r.status)+'</option>').join('');$('builds').innerHTML=runs.length?runs.map(r=>'<div class="build" data-id="'+r.id+'"><div><strong>#'+r.run_number+' · '+esc(r.name||'Workflow')+'</strong><small>'+esc(r.branch||'no branch')+' · '+esc((r.commit||'').slice(0,12))+' · '+esc(r.author||'unknown')+'</small></div><span class="pill '+(r.conclusion==='success'?'success':r.conclusion?'failure':'')+'">'+esc(r.conclusion||r.status||'unknown')+'</span></div>').join(''):'<div class="muted">No builds match these filters.</div>';document.querySelectorAll('#builds .build').forEach(x=>x.onclick=()=>selectRun(state.runs.find(r=>String(r.id)===x.dataset.id)))}
 function selectRun(r){$('selector').value=r.id;summary(r);loadArtifacts(r.id)}
 async function post(path,body){const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const x=r.headers.get('content-type')?.includes('json')?await r.json():null;if(!r.ok)throw Error(x?.error||'Request failed');return x}
 async function inspect(testOnly=false){if(!$('repo').value.trim())throw Error('Enter a repository link first.');const data=await post(testOnly?'/test':'/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value});if(testOnly){message('Token works and the repository is accessible.','ok');return}
@@ -354,7 +418,12 @@ $('inspect').onclick=async()=>{try{$('inspect').disabled=true;message('Loading w
 $('inspect').addEventListener('click',loadHistory);
 $('workflow').onchange=async()=>{try{message('Loading builds for this workflow…');const data=await post('/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value});state.runs=data.runs.map(x=>x.summary);renderRuns();if(state.runs[0])selectRun(state.runs[0])}catch(e){message(e.message,'error')}};
 $('build').onchange=()=>{const r=state.runs.find(x=>String(x.id)===$('build').value);if(r)selectRun(r)};
-$('download').onclick=async()=>{try{$('download').disabled=true;message('Fetching artifacts and verifying checksums…');const data=await post('/fetch',{repo:$('repo').value,pat:token(),selector:$('selector').value||$('build').value,workflow_id:$('workflow').value,logs:$('logs').checked,auto:$('auto').checked,save_to:$('save').value});saveResponse(data,'bundle');message('Build bundle ready. '+data.artifacts+' artifact(s) included'+(data.logs?' and logs.':'.'),'ok')}catch(e){message(e.message,'error')}finally{$('download').disabled=false}};
+ function startProgress(){let n=0;clearInterval(state.progressTimer);state.progressTimer=setInterval(()=>{n=(n+1)%4;message(['Contacting GitHub…','Downloading artifacts…','Verifying checksums…','Preparing browser download…'][n]);},900)}
+ function stopProgress(){clearInterval(state.progressTimer);state.progressTimer=null}
+ $('download').onclick=async()=>{try{$('download').disabled=true;startProgress();const data=await post('/fetch',{repo:$('repo').value,pat:token(),selector:$('selector').value||$('build').value,workflow_id:$('workflow').value,logs:$('logs').checked,auto:$('auto').checked,save_to:$('save').value});stopProgress();saveResponse(data,'bundle');message('Build bundle ready. '+data.artifacts+' artifact(s) included'+(data.logs?' and logs.':'.'),'ok')}catch(e){stopProgress();message(e.message,'error')}finally{$('download').disabled=false}};
+ function refresh(){if(!$('repo').value.trim())return;post('/inspect',{repo:$('repo').value,pat:token(),workflow_id:$('workflow').value}).then(data=>{state.runs=data.runs.map(x=>x.summary);renderRuns();message('Build list refreshed.','ok')}).catch(e=>message(e.message,'error'))}
+ $('push').onclick=async()=>{const file=$('pushFile').files[0];if(!file){$('pushStatus').textContent='Choose a file first.';return}if(file.size>9*1024*1024){$('pushStatus').textContent='The file must be smaller than 9 MB.';return}try{$('push').disabled=true;$('pushStatus').textContent='Reading file and creating commit…';const bytes=new Uint8Array(await file.arrayBuffer());let binary='';bytes.forEach(x=>binary+=String.fromCharCode(x));const data=await post('/push',{repo:$('repo').value,pat:token(),branch:$('pushBranch').value,path:$('pushPath').value||file.name,message:$('pushMessage').value,overwrite:$('overwrite').checked,content:btoa(binary)});$('pushStatus').textContent='Committed '+data.path+' to '+data.branch+'.';if(data.url)window.open(data.url,'_blank','noopener')}catch(e){$('pushStatus').textContent=e.message}finally{$('push').disabled=false}};
+ ['branchFilter','statusFilter','eventFilter','nameFilter','dateFilter'].forEach(id=>$(id)?.addEventListener('input',renderRuns));$('refresh').onclick=refresh;$('autoRefresh').onchange=()=>{clearInterval(state.refreshTimer);if($('autoRefresh').checked)state.refreshTimer=setInterval(refresh,30000)};
 $('compare').onclick=async()=>{try{const selected=[...document.querySelectorAll('#commitHistory input:checked')].map(x=>x.value);const x=await post('/compare',{repo:$('repo').value,pat:token(),commits:selected});$('comparison').innerHTML=x.comparisons.map(c=>'<div class="build"><div><strong>'+c.base+' → '+c.head+'</strong><small>'+c.commits+' commit(s) · '+c.files+' changed file(s) · '+c.status+'</small></div><span class="pill">'+c.ahead_by+' ahead</span></div>').join('')}catch(e){message(e.message,'error')}};
 authState();
 </script></body></html>"""
@@ -504,6 +573,18 @@ class Handler(BaseHTTPRequestHandler):
                         })
                 self.respond(HTTPStatus.OK, {"comparisons": comparisons})
                 return
+            if self.path == "/push":
+                encoded = str(payload.get("content", "") or "")
+                try:
+                    base64.b64decode(encoded, validate=True)
+                except (ValueError, TypeError):
+                    raise ValueError("The selected file could not be read.")
+                result = push_file(
+                    owner, repo, token, payload.get("branch"), payload.get("path"),
+                    payload.get("message"), encoded, bool(payload.get("overwrite")),
+                )
+                self.respond(HTTPStatus.OK, result)
+                return
             if self.path == "/artifact":
                 artifacts = fetch_artifacts(owner, repo, token, int(payload.get("run_id")))
                 artifact = next((a for a in artifacts if str(a.get("id")) == str(payload.get("artifact_id"))), None)
@@ -529,6 +610,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(HTTPStatus.NOT_FOUND)
         except (ValueError, HTTPError, URLError, RuntimeError, json.JSONDecodeError) as error:
             self.respond(HTTPStatus.BAD_REQUEST, {"error": nice_error(error)})
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception:
             self.respond(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "The request could not be completed. No token was saved."})
 
