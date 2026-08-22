@@ -292,19 +292,19 @@ func (c *client) rateLimit(repo repoRef) (map[string]any, error) {
 		}
 	}
 	return map[string]any{
-		"remaining":     limit.Resources.Core.Remaining,
-		"limit":         limit.Resources.Core.Limit,
-		"reset":         time.Unix(limit.Resources.Core.Reset, 0).UTC().Format(time.RFC3339),
-		"repository":    repo.owner + "/" + repo.name,
-		"visibility":    visibility,
-		"authenticated": c.token != "",
-		"scopes":        splitHeader(headers.Get("X-OAuth-Scopes")),
+		"remaining":            limit.Resources.Core.Remaining,
+		"limit":                limit.Resources.Core.Limit,
+		"reset":                time.Unix(limit.Resources.Core.Reset, 0).UTC().Format(time.RFC3339),
+		"repository":           repo.owner + "/" + repo.name,
+		"visibility":           visibility,
+		"authenticated":        c.token != "",
+		"scopes":               splitHeader(headers.Get("X-OAuth-Scopes")),
 		"header_authenticated": headers.Get("X-OAuth-Scopes") != "",
 		"permissions": map[string]bool{
-			"Actions read":          c.token == "" || hasScope(headers, "actions:read") || hasScope(headers, "repo"),
-			"Contents read":         c.token == "" || hasScope(headers, "contents:read") || hasScope(headers, "repo") || hasScope(headers, "public_repo"),
-			"Contents write":        c.token == "" || hasScope(headers, "contents:write") || hasScope(headers, "repo"),
-			"Pull requests write":   c.token == "" || hasScope(headers, "pull_requests:write") || hasScope(headers, "repo"),
+			"Actions read":        c.token == "" || hasScope(headers, "actions:read") || hasScope(headers, "repo"),
+			"Contents read":       c.token == "" || hasScope(headers, "contents:read") || hasScope(headers, "repo") || hasScope(headers, "public_repo"),
+			"Contents write":      c.token == "" || hasScope(headers, "contents:write") || hasScope(headers, "repo"),
+			"Pull requests write": c.token == "" || hasScope(headers, "pull_requests:write") || hasScope(headers, "repo"),
 		},
 	}, nil
 }
@@ -844,6 +844,7 @@ func main() {
 	control := flag.String("window", "", "open a local control window on HOST:PORT, e.g. 127.0.0.1:8765")
 	background := flag.Bool("background", false, "run fetch or file upload as a cancellable background job")
 	downloadServer := flag.String("download-server", "", "serve persistent downloads on HOST:PORT")
+	browser := flag.String("browser", "", "open the local browser workflow on HOST:PORT, e.g. 127.0.0.1:8767")
 	oauthLoginFlag := flag.Bool("oauth-login", false, "complete OAuth login in a browser and store the token in the OS credential manager")
 	oauthRevokeFlag := flag.Bool("oauth-revoke", false, "revoke the stored OAuth access grant")
 	device := flag.Bool("device-login", false, "authenticate with GitHub's device flow without GitHub CLI")
@@ -947,6 +948,14 @@ func main() {
 		return
 	}
 	c := &client{token: token, http: &http.Client{Timeout: 90 * time.Second}}
+	if *browser != "" {
+		fmt.Println("Browser workflow available at http://" + *browser)
+		if err := serveBrowser(c, repo, *browser); err != nil {
+			fmt.Fprintln(os.Stderr, "Browser workflow stopped:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	jobs := newLocalJobs()
 	if *downloadServer != "" {
 		go func() {
