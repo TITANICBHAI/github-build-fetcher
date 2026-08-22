@@ -1,0 +1,16 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "oez5IR8_1Vgp3quTqSH75"
+uri = "file://downloads/focusflow-debug-v1.0.9-vc10-run557.zip"
+type = "unspecified"
+title = "FocusFlow build artifacts — run 557"
+description = "Downloaded directly from GitHub Actions run 32551351734 and verified against GitHub's SHA-256 digest. Contains 3 debug APK files."
+logical_id = "31684d53-f540-4046-9d22-911b9a166930"
+content_hash = "sha256:8a8be21778c4eed5f072bcfe12513786c65a44515f43e46f9809cbe69075a67b"
+size = 103351734
+mtime_ms = 1787374784823
+storage_uri = "gcs://replit-rams-assets-pike/rams/assets/repl:e9b82c73-d059-49a2-b21a-9f910b4bb367/31684d53-f540-4046-9d22-911b9a166930/c0cbf8b9-ce16-4b09-b98c-ed807297bf2b"
+storage_version_token = "1787374792861388"
+content_type = "application/octet-stream"
