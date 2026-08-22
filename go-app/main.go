@@ -45,6 +45,7 @@ type workflowRun struct {
 	ID         int64  `json:"id"`
 	RunNumber  int    `json:"run_number"`
 	Name       string `json:"name"`
+	Event      string `json:"event"`
 	Status     string `json:"status"`
 	Conclusion string `json:"conclusion"`
 	Branch     string `json:"head_branch"`
@@ -64,7 +65,6 @@ type workflow struct {
 }
 type job struct {
 	Name        string `json:"name"`
-	Event       string `json:"event"`
 	Status      string `json:"status"`
 	Conclusion  string `json:"conclusion"`
 	HTMLURL     string `json:"html_url"`
@@ -612,6 +612,70 @@ func scanProject(root string) ([]string, error) {
 	return files, err
 }
 
+type fileStamp struct {
+	size    int64
+	modTime time.Time
+}
+
+func projectSnapshot(root string) (map[string]fileStamp, error) {
+	files := make(map[string]fileStamp)
+	err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, _ := filepath.Rel(root, path)
+		lower := strings.ToLower(filepath.ToSlash(relative))
+		if info.IsDir() {
+			if relative == ".git" || strings.HasPrefix(relative, ".git"+string(os.PathSeparator)) ||
+				strings.HasPrefix(lower, "data/exports/") || strings.HasPrefix(lower, "downloads/") ||
+				strings.HasPrefix(lower, ".cache/") || strings.HasPrefix(lower, ".local/") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if relative != "." {
+			files[relative] = fileStamp{size: info.Size(), modTime: info.ModTime()}
+		}
+		return nil
+	})
+	return files, err
+}
+
+func watchProject(c *client, repo repoRef, root, remotePrefix, branch, message string, interval time.Duration, dryRun, confirm bool) error {
+	if interval < 10*time.Second {
+		return errors.New("watch interval must be at least 10 seconds")
+	}
+	previous, err := projectSnapshot(root)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Watching %s every %s. Press Ctrl+C to stop.\n", root, interval)
+	firstConfirmation := confirm
+	for {
+		time.Sleep(interval)
+		current, err := projectSnapshot(root)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Watch scan failed:", err)
+			continue
+		}
+		for path, stamp := range current {
+			old, existed := previous[path]
+			if existed && old == stamp {
+				continue
+			}
+			localPath := filepath.Join(root, path)
+			remotePath := strings.Trim(strings.TrimSuffix(remotePrefix, "/")+"/"+filepath.ToSlash(path), "/")
+			fmt.Printf("\nChange detected: %s\n", path)
+			if err := uploadFile(c, repo, localPath, branch, remotePath, message, true, dryRun, firstConfirmation); err != nil {
+				fmt.Fprintln(os.Stderr, "Automatic upload skipped:", err)
+				continue
+			}
+			firstConfirmation = false
+		}
+		previous = current
+	}
+}
+
 func prompt(message string) string {
 	fmt.Print(message)
 	reader := bufio.NewReader(os.Stdin)
@@ -655,6 +719,10 @@ func main() {
 	overwrite := flag.Bool("overwrite", false, "allow --upload to replace an existing file")
 	dryRun := flag.Bool("dry-run", false, "preview an upload without changing GitHub")
 	confirm := flag.Bool("confirm", false, "confirm an upload before sending it")
+	watch := flag.Bool("watch", false, "watch a directory and upload changed files")
+	watchDir := flag.String("watch-dir", ".", "directory to watch with --watch")
+	watchPath := flag.String("watch-path", "uploads", "repository directory prefix for --watch")
+	watchInterval := flag.Int("watch-interval", 60, "seconds between --watch scans")
 	flag.Parse()
 
 	if *scan {
@@ -686,6 +754,13 @@ func main() {
 		}
 		if err := uploadFile(c, repo, *upload, *branch, *uploadPath, *message, *overwrite, *dryRun, *confirm); err != nil {
 			fmt.Fprintln(os.Stderr, "Upload failed:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if *watch {
+		if err := watchProject(c, repo, *watchDir, *watchPath, *branch, *message, time.Duration(*watchInterval)*time.Second, *dryRun, *confirm); err != nil {
+			fmt.Fprintln(os.Stderr, "Watch failed:", err)
 			os.Exit(1)
 		}
 		return

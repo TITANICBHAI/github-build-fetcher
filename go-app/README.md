@@ -60,8 +60,19 @@ The upload uses the GitHub Contents API and refuses protected files, detected
 credentials, oversized files, and accidental overwrites unless `--overwrite`
 is supplied.
 
-This first Go milestone is intentionally dependency-free and covers Actions
-inspection, artifact/log export, progress reporting, safe file upload, and
-local safety scanning. A later milestone can add a richer native desktop
-window, folder watch mode, and settings storage using the operating system
-credential manager.
+Watch a project directory and upload changed files without installing Git:
+
+```bash
+./github-fetcher --repo https://github.com/owner/repository \
+  --watch --watch-dir . --watch-path project --watch-interval 60 \
+  --branch main --confirm
+```
+
+Watch mode ignores Git metadata, caches, local exports, and downloads. Every
+changed file still passes the secret and 10 MB safety checks. Use
+`--dry-run` first to preview changes without contacting GitHub.
+
+This dependency-free Go milestone covers Actions inspection, artifact/log
+export, progress reporting, safe file upload, local safety scanning, and
+folder watch mode. A later milestone can add a richer native desktop window
+and settings storage using the operating system credential manager.
